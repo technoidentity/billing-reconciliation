@@ -1,0 +1,13 @@
+target/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.vscode/
+*.log
+.mvn/wrapper/maven-wrapper.jar
+.env
+
+# Local docs / demo evidence (screenshots, run reports)
+/docs/

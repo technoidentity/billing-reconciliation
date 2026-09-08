@@ -1,0 +1,111 @@
+services:
+  postgresql:
+    container_name: billing-postgres
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    shm_size: 1gb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - billing-net
+
+  temporal-postgres:
+    container_name: temporal-postgres
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - billing-net
+
+  temporal:
+    container_name: billing-temporal
+    image: temporalio/auto-setup:latest
+    restart: unless-stopped
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    volumes:
+      - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+    networks:
+      - billing-net
+
+  temporal-ui:
+    container_name: billing-temporal-ui
+    image: temporalio/ui:2.40.1
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+    ports:
+      - "8088:8080"
+    networks:
+      - billing-net
+
+  app:
+    container_name: billing-app
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      SERVER_PORT: 8080
+      DB_HOST: postgresql
+      DB_PORT: 5432
+      DB_NAME: billing
+      DB_USER: billing
+      DB_PASSWORD: billing
+      TEMPORAL_TARGET: ${TEMPORAL_TARGET:-temporal:7233}
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      TEMPORAL_ENABLE_HTTPS: ${TEMPORAL_ENABLE_HTTPS:-false}
+      TEMPORAL_TLS: ${TEMPORAL_TLS:-false}
+      TEMPORAL_API_KEY: ${TEMPORAL_API_KEY:-}
+      TEMPORAL_IDENTITY: ${TEMPORAL_IDENTITY:-}
+      VENDOR_API_URL: http://localhost:8080
+      CUSTOMER_API_URL: http://localhost:8080
+    ports:
+      - "8080:8080"
+    networks:
+      - billing-net
+
+volumes:
+  postgres_data:
+  temporal-postgres-data:
+
+networks:
+  billing-net:
+    driver: bridge

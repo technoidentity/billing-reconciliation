@@ -1,0 +1,167 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: billing-reconciliation
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:billing}
+    username: ${DB_USER:billing}
+    password: ${DB_PASSWORD:billing}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:30}
+      minimum-idle: 5
+  sql:
+    init:
+      mode: never
+  # Temporal connection is env-driven. Local docker defaults; Cloud via TEMPORAL_* env vars.
+  # Cloud API key:
+  #   TEMPORAL_TARGET=<namespace>.<accountId>.tmprl.cloud:7233
+  #     or regional <region>.<cloud>.api.temporal.io:7233
+  #   TEMPORAL_NAMESPACE=<namespace>.<accountId>
+  #   TEMPORAL_ENABLE_HTTPS=true
+  #   TEMPORAL_API_KEY=<key>
+  temporal:
+    connection:
+      target: ${TEMPORAL_TARGET:127.0.0.1:7233}          # gRPC endpoint. Cloud: <ns>.<accountId>.tmprl.cloud:7233
+      enable-https: ${TEMPORAL_ENABLE_HTTPS:${TEMPORAL_TLS:false}}  # TLS required for Temporal Cloud (also auto-on when api-key is set)
+      api-key: ${TEMPORAL_API_KEY:}                       # Cloud API key → Authorization: Bearer (blank locally)
+    namespace: ${TEMPORAL_NAMESPACE:default}             # Temporal namespace. Cloud: <namespace>.<accountId>
+    identity: ${TEMPORAL_IDENTITY:}                      # worker identity in the UI (blank = SDK default host@pid)
+    start-workers: true
+    workers-auto-discovery:
+      packages:
+        - com.billing.reconciliation
+    workers:
+      - task-queue: ${TEMPORAL_TASK_QUEUE:billing-reconciliation-queue}
+        name: billing-reconciliation-worker
+        capacity:
+          max-concurrent-workflow-task-executors: ${WORKER_WORKFLOW_EXECUTORS:50}
+          max-concurrent-activity-executors: ${WORKER_ACTIVITY_EXECUTORS:100}
+          max-concurrent-local-activity-executors: 50
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.billing.reconciliation: INFO
+    io.temporal: WARN
+
+# All billing / Temporal business knobs live here. Workflows receive a snapshot of
+# these values as input so activity timeouts stay deterministic on replay.
+billing:
+  task-queue: ${TEMPORAL_TASK_QUEUE:billing-reconciliation-queue}
+  batch-size: ${BILLING_BATCH_SIZE:100000}
+  max-parallel-batches: ${BILLING_MAX_PARALLEL_BATCHES:12}
+
+  schedule:
+    enabled: ${BILLING_SCHEDULE_ENABLED:true}
+    id: daily-billing-reconciliation
+    # Daily 8:00 AM job (demo scenario step 1)
+    cron: "0 8 * * *"
+    timezone: America/Chicago
+    workflow-id-prefix: billing-reconciliation
+    # If yesterday's run is still processing/awaiting a signal at 8:00 AM:
+    # BUFFER_ONE (queue one), SKIP, ALLOW_ALL, CANCEL_OTHER, TERMINATE_OTHER.
+    overlap-policy: BUFFER_ONE
+
+  # Enrichment splits the id list into chunks and calls the API concurrently, capped at
+  # max-concurrent-calls in-flight requests per batch (demo scenario steps 5-6).
+  vendor-api:
+    base-url: ${VENDOR_API_URL:http://localhost:8080}
+    timeout: 30s
+    max-concurrent-calls: ${VENDOR_MAX_CONCURRENT:1000}
+    bulk-chunk-size: ${VENDOR_BULK_CHUNK:200}
+
+  customer-api:
+    base-url: ${CUSTOMER_API_URL:http://localhost:8080}
+    timeout: 30s
+    max-concurrent-calls: ${CUSTOMER_MAX_CONCURRENT:1000}
+    bulk-chunk-size: ${CUSTOMER_BULK_CHUNK:200}
+
+  discrepancy:
+    amount-tolerance: 0.01
+    # Each 100K child waits for a resolveDiscrepancies signal (COMPENSATE / CONTINUE), then
+    # Continue-As-News to re-process corrected data. Loop guard on how many correction rounds to allow.
+    max-resolution-rounds: 10
+
+  workflow:
+    # 0 = unbounded. Long-running orchestrator; each child may wait a long time for a human signal.
+    execution-timeout: 0s
+    child-execution-timeout: 0s
+
+  rules:
+    surcharge-threshold: 10000
+    surcharge-rate: 0.02
+    mid-tier-threshold: 1000
+    mid-tier-flat-fee: 5
+    discount-threshold: 5000
+    discount-rate: 0.05
+    late-days: 30
+    late-fee-rate: 0.02
+
+  notifications:
+    recipients:
+      - billing-ops@example.com
+      - finance@example.com
+    teams-channel: billing-ops-teams
+
+  # Retry: exponential 1s, 2s, 4s, 8s, 16s (demo scenario step 4 / vendor timeout)
+  activities:
+    ingestion:
+      start-to-close-timeout: 15m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 5
+        do-not-retry:
+          - ValidationError
+    enrichment:
+      start-to-close-timeout: 30m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 5
+    billing-rules:
+      start-to-close-timeout: 30m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 5
+    reconciliation:
+      start-to-close-timeout: 20m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 5
+    reporting:
+      start-to-close-timeout: 15m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 3
+    compensation:
+      start-to-close-timeout: 20m
+      heartbeat-timeout: 2m
+      retry:
+        initial-interval: 1s
+        backoff-coefficient: 2.0
+        maximum-interval: 16s
+        maximum-attempts: 3
