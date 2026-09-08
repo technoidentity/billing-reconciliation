@@ -5,6 +5,8 @@ import io.temporal.activity.ActivityExecutionContext;
 
 final class Heartbeats {
 
+    static final int CHUNK = 5_000;
+
     private Heartbeats() {
     }
 

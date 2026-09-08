@@ -123,8 +123,6 @@ billing:
         backoff-coefficient: 2.0
         maximum-interval: 16s
         maximum-attempts: 5
-        do-not-retry:
-          - ValidationError
     enrichment:
       start-to-close-timeout: 30m
       heartbeat-timeout: 2m

@@ -3,10 +3,13 @@ package com.billing.reconciliation.activity;
 import com.billing.reconciliation.config.BillingProperties;
 import com.billing.reconciliation.config.TaskQueues;
 import com.billing.reconciliation.db.BillingJdbc;
+import com.billing.reconciliation.dto.BillingTransactionDto;
+import com.billing.reconciliation.dto.CustomerDto;
+import com.billing.reconciliation.dto.ProcessedTransactionDto;
+import com.billing.reconciliation.dto.VendorDto;
+import com.billing.reconciliation.engine.RecordEnricher;
 import com.billing.reconciliation.model.BatchRef;
-import com.billing.reconciliation.model.CustomerDto;
 import com.billing.reconciliation.model.StepResult;
-import com.billing.reconciliation.model.VendorDto;
 import io.temporal.activity.Activity;
 import io.temporal.spring.boot.ActivityImpl;
 import org.slf4j.Logger;
@@ -19,6 +22,7 @@ import org.springframework.web.client.RestClient;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -32,10 +36,12 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
     private final BillingJdbc jdbc;
     private final BillingProperties properties;
     private final RestClient restClient;
+    private final RecordEnricher recordEnricher;
 
-    public EnrichmentActivitiesImpl(BillingJdbc jdbc, BillingProperties properties) {
+    public EnrichmentActivitiesImpl(BillingJdbc jdbc, BillingProperties properties, RecordEnricher recordEnricher) {
         this.jdbc = jdbc;
         this.properties = properties;
+        this.recordEnricher = recordEnricher;
         int timeoutMs = (int) properties.getVendorApi().getTimeout().toMillis();
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(timeoutMs);
@@ -90,9 +96,24 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
     @Override
     public StepResult enrichRecords(String runId, BatchRef batch) {
         Heartbeats.beat("enrich-start-" + batch.getBatchNo());
-        long count = jdbc.enrichBatch(runId, batch);
+        List<BillingTransactionDto> rows = jdbc.loadValidBatch(batch.getFromId(), batch.getToId());
+        Map<String, VendorDto> vendors = jdbc.loadVendorCache(runId);
+        Map<String, CustomerDto> customers = jdbc.loadCustomerCache(runId);
+        List<ProcessedTransactionDto> processed = new ArrayList<>();
+        int total = rows.size();
+        for (int i = 0; i < total; i += Heartbeats.CHUNK) {
+            List<BillingTransactionDto> chunk = rows.subList(i, Math.min(i + Heartbeats.CHUNK, total));
+            List<ProcessedTransactionDto> enriched = recordEnricher.enrich(chunk, vendors, customers, batch.getBatchNo());
+            processed.addAll(enriched);
+            jdbc.upsertProcessedTransactions(runId, enriched);
+            Heartbeats.beat("enrich-chunk-" + Math.min(i + Heartbeats.CHUNK, total) + "/" + total);
+        }
+        if (total == 0) {
+            Heartbeats.beat("enrich-chunk-0/0");
+        }
         Heartbeats.beat("enrich-done-" + batch.getBatchNo());
-        return new StepResult("ENRICH_RECORDS", count, "Merged vendor and customer data for batch " + batch.getBatchNo());
+        return new StepResult("ENRICH_RECORDS", processed.size(),
+                "Merged vendor and customer data for batch " + batch.getBatchNo());
     }
 
     /**

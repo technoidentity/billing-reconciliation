@@ -1,22 +1,28 @@
 package com.billing.reconciliation.db;
 
+import com.billing.reconciliation.dto.BillingAmountCorrection;
+import com.billing.reconciliation.dto.BillingTransactionDto;
+import com.billing.reconciliation.dto.CustomerDto;
+import com.billing.reconciliation.dto.DiscrepancyDto;
+import com.billing.reconciliation.dto.ProcessedTransactionDto;
+import com.billing.reconciliation.dto.ValidationErrorDto;
+import com.billing.reconciliation.dto.VendorDto;
 import com.billing.reconciliation.model.BatchRef;
-import com.billing.reconciliation.model.CustomerDto;
 import com.billing.reconciliation.model.DiscrepancySummary;
 import com.billing.reconciliation.model.ReconciliationResult;
-import com.billing.reconciliation.model.VendorDto;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
 import java.sql.Date;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.IntConsumer;
 
 @Repository
 public class BillingJdbc {
@@ -64,69 +70,88 @@ public class BillingJdbc {
         return new ArrayList<>(batches);
     }
 
-    public long countByStatus(long fromId, long toId, String status) {
-        Long count = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM billing_transactions WHERE id BETWEEN ? AND ? AND status = ?",
-                Long.class, fromId, toId, status);
-        return count == null ? 0 : count;
+    /**
+     * Loads every row in the inclusive id range for Java schema validation (not only {@code NEW}),
+     * so Continue-As-New re-validates after a data fix.
+     */
+    public List<BillingTransactionDto> loadBatchForValidation(long fromId, long toId) {
+        return jdbc.query(
+                """
+                SELECT id, txn_id, vendor_id, customer_id, amount, currency
+                FROM billing_transactions
+                WHERE id BETWEEN ? AND ?
+                ORDER BY id
+                """,
+                (rs, i) -> mapBillingTransaction(rs),
+                fromId, toId);
     }
 
-    public long markInvalid(String runId, long fromId, long toId) {
+    /**
+     * VALID rows in the inclusive id range, ready for Java enrichment.
+     */
+    public List<BillingTransactionDto> loadValidBatch(long fromId, long toId) {
+        return jdbc.query(
+                """
+                SELECT id, txn_id, vendor_id, customer_id, amount, currency
+                FROM billing_transactions
+                WHERE id BETWEEN ? AND ? AND status = 'VALID'
+                ORDER BY id
+                """,
+                (rs, i) -> mapBillingTransaction(rs),
+                fromId, toId);
+    }
+
+    /**
+     * Batched status updates. Empty lists are skipped. Ids are chunked to stay under parameter limits.
+     */
+    public void updateStatuses(List<Long> validIds, List<Long> invalidIds) {
+        updateStatusChunked(validIds, "VALID");
+        updateStatusChunked(invalidIds, "INVALID");
+    }
+
+    /**
+     * Replaces {@code validation_errors} for the batch: delete existing rows for the id range, then
+     * batch-insert the current per-field failures from Java validation.
+     */
+    public void replaceValidationErrors(String runId, BatchRef batch, List<ValidationErrorDto> errors) {
         jdbc.update(
                 """
                 DELETE FROM validation_errors
                 WHERE run_id = ?
                   AND txn_id IN (SELECT txn_id FROM billing_transactions WHERE id BETWEEN ? AND ?)
                 """,
-                runId, fromId, toId);
-        jdbc.update(
-                """
-                INSERT INTO validation_errors (run_id, txn_id, reason)
-                SELECT ?, txn_id, 'amount must be greater than 0'
-                FROM billing_transactions
-                WHERE id BETWEEN ? AND ? AND amount <= 0
-                """,
-                runId, fromId, toId);
-        jdbc.update(
-                """
-                INSERT INTO validation_errors (run_id, txn_id, reason)
-                SELECT ?, txn_id, 'txn_id is blank'
-                FROM billing_transactions
-                WHERE id BETWEEN ? AND ? AND (txn_id IS NULL OR txn_id = '')
-                """,
-                runId, fromId, toId);
-        jdbc.update(
-                """
-                INSERT INTO validation_errors (run_id, txn_id, reason)
-                SELECT ?, txn_id, 'currency is blank'
-                FROM billing_transactions
-                WHERE id BETWEEN ? AND ? AND (currency IS NULL OR currency = '')
-                """,
-                runId, fromId, toId);
-        return jdbc.update(
-                """
-                UPDATE billing_transactions
-                SET status = 'INVALID'
-                WHERE id BETWEEN ? AND ?
-                  AND status = 'NEW'
-                  AND (amount <= 0 OR txn_id IS NULL OR txn_id = '' OR vendor_id IS NULL OR vendor_id = ''
-                       OR customer_id IS NULL OR customer_id = '' OR currency IS NULL OR currency = '')
-                """,
-                fromId, toId);
+                runId, batch.getFromId(), batch.getToId());
+        if (errors == null || errors.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "INSERT INTO validation_errors (run_id, txn_id, reason) VALUES (?, ?, ?)",
+                errors,
+                500,
+                (ps, error) -> {
+                    ps.setString(1, runId);
+                    ps.setString(2, error.getTxnId());
+                    ps.setString(3, error.getReason());
+                });
     }
 
-    public long markValid(long fromId, long toId) {
-        return jdbc.update(
-                """
-                UPDATE billing_transactions
-                SET status = 'VALID'
-                WHERE id BETWEEN ? AND ? AND status = 'NEW' AND amount > 0
-                  AND txn_id IS NOT NULL AND txn_id <> ''
-                  AND vendor_id IS NOT NULL AND vendor_id <> ''
-                  AND customer_id IS NOT NULL AND customer_id <> ''
-                  AND currency IS NOT NULL AND currency <> ''
-                """,
-                fromId, toId);
+    private void updateStatusChunked(List<Long> ids, String status) {
+        if (ids == null || ids.isEmpty()) {
+            return;
+        }
+        final int chunkSize = 5000;
+        for (int i = 0; i < ids.size(); i += chunkSize) {
+            List<Long> chunk = ids.subList(i, Math.min(i + chunkSize, ids.size()));
+            String placeholders = String.join(",", chunk.stream().map(id -> "?").toList());
+            Object[] args = new Object[chunk.size() + 1];
+            args[0] = status;
+            for (int j = 0; j < chunk.size(); j++) {
+                args[j + 1] = chunk.get(j);
+            }
+            jdbc.update(
+                    "UPDATE billing_transactions SET status = ? WHERE id IN (" + placeholders + ")",
+                    args);
+        }
     }
 
     public List<String> distinctVendorIds(long fromId, long toId) {
@@ -211,70 +236,125 @@ public class BillingJdbc {
                 });
     }
 
-    public long enrichBatch(String runId, BatchRef batch) {
-        return jdbc.update(
+    public Map<String, VendorDto> loadVendorCache(String runId) {
+        Map<String, VendorDto> vendors = new HashMap<>();
+        List<VendorDto> rows = jdbc.query(
+                "SELECT vendor_id, vendor_name, status FROM vendor_cache WHERE run_id = ?",
+                (rs, i) -> new VendorDto(rs.getString("vendor_id"), rs.getString("vendor_name"), rs.getString("status")),
+                runId);
+        for (VendorDto vendor : rows) {
+            vendors.put(vendor.getVendorId(), vendor);
+        }
+        return vendors;
+    }
+
+    public Map<String, CustomerDto> loadCustomerCache(String runId) {
+        Map<String, CustomerDto> customers = new HashMap<>();
+        List<CustomerDto> rows = jdbc.query(
+                "SELECT customer_id, customer_name, status FROM customer_cache WHERE run_id = ?",
+                (rs, i) -> new CustomerDto(
+                        rs.getString("customer_id"),
+                        rs.getString("customer_name"),
+                        rs.getString("status")),
+                runId);
+        for (CustomerDto customer : rows) {
+            customers.put(customer.getCustomerId(), customer);
+        }
+        return customers;
+    }
+
+    public void upsertProcessedTransactions(String runId, List<ProcessedTransactionDto> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
                 """
                 INSERT INTO processed_transactions
                     (run_id, txn_id, vendor_name, customer_name, currency, original_amount, adjustment, discount, penalty, final_amount, batch_no)
-                SELECT ?, t.txn_id, v.vendor_name, c.customer_name, t.currency, t.amount, 0, 0, 0, t.amount, ?
-                FROM billing_transactions t
-                JOIN vendor_cache v ON v.run_id = ? AND v.vendor_id = t.vendor_id
-                JOIN customer_cache c ON c.run_id = ? AND c.customer_id = t.customer_id
-                WHERE t.id BETWEEN ? AND ? AND t.status = 'VALID'
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id, txn_id) DO UPDATE SET
                     vendor_name = EXCLUDED.vendor_name,
                     customer_name = EXCLUDED.customer_name,
                     currency = EXCLUDED.currency,
                     original_amount = EXCLUDED.original_amount,
-                    adjustment = 0,
-                    discount = 0,
-                    penalty = 0,
-                    final_amount = EXCLUDED.original_amount,
+                    adjustment = EXCLUDED.adjustment,
+                    discount = EXCLUDED.discount,
+                    penalty = EXCLUDED.penalty,
+                    final_amount = EXCLUDED.final_amount,
                     batch_no = EXCLUDED.batch_no
                 """,
-                runId, batch.getBatchNo(), runId, runId, batch.getFromId(), batch.getToId());
+                rows,
+                500,
+                (ps, row) -> {
+                    ps.setString(1, runId);
+                    ps.setString(2, row.getTxnId());
+                    ps.setString(3, row.getVendorName());
+                    ps.setString(4, row.getCustomerName());
+                    ps.setString(5, row.getCurrency());
+                    ps.setBigDecimal(6, row.getOriginalAmount());
+                    ps.setBigDecimal(7, row.getAdjustment());
+                    ps.setBigDecimal(8, row.getDiscount());
+                    ps.setBigDecimal(9, row.getPenalty());
+                    ps.setBigDecimal(10, row.getFinalAmount());
+                    ps.setInt(11, row.getBatchNo());
+                });
     }
 
-    public long applySurcharge(String runId, BatchRef batch, double threshold, double rate,
-                               double midTierThreshold, double midTierFlatFee) {
-        return jdbc.update(
+    public List<ProcessedTransactionDto> loadProcessedBatch(String runId, BatchRef batch) {
+        return jdbc.query(
+                """
+                SELECT DISTINCT ON (p.txn_id) p.txn_id, p.vendor_name, p.customer_name, p.currency,
+                       p.original_amount, p.adjustment, p.discount, p.penalty, p.final_amount, p.batch_no,
+                       t.due_date
+                FROM processed_transactions p
+                LEFT JOIN billing_transactions t ON t.txn_id = p.txn_id
+                WHERE p.run_id = ? AND p.batch_no = ?
+                ORDER BY p.txn_id, t.id
+                """,
+                (rs, i) -> mapProcessed(rs),
+                runId, batch.getBatchNo());
+    }
+
+    public List<ProcessedTransactionDto> loadProcessedByTxnIds(String runId, List<String> txnIds) {
+        if (txnIds == null || txnIds.isEmpty()) {
+            return List.of();
+        }
+        List<ProcessedTransactionDto> rows = new ArrayList<>();
+        forEachInChunk(txnIds, chunk -> {
+            String ph = placeholders(chunk.size());
+            List<Object> args = new ArrayList<>();
+            args.add(runId);
+            args.addAll(chunk);
+            rows.addAll(jdbc.query(
+                    "SELECT txn_id, vendor_name, customer_name, currency, original_amount, adjustment, "
+                            + "discount, penalty, final_amount, batch_no, NULL AS due_date "
+                            + "FROM processed_transactions WHERE run_id = ? AND txn_id IN (" + ph + ")",
+                    (rs, i) -> mapProcessed(rs),
+                    args.toArray()));
+        });
+        return rows;
+    }
+
+    public void updateProcessedMoney(String runId, List<ProcessedTransactionDto> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
                 """
                 UPDATE processed_transactions
-                SET final_amount = CASE
-                    WHEN original_amount > CAST(? AS numeric)
-                        THEN ROUND(original_amount * (1 + CAST(? AS numeric)), 2)
-                    WHEN original_amount > CAST(? AS numeric)
-                        THEN ROUND(original_amount + CAST(? AS numeric), 2)
-                    ELSE original_amount
-                END
-                WHERE run_id = ? AND batch_no = ?
+                SET adjustment = ?, discount = ?, penalty = ?, final_amount = ?
+                WHERE run_id = ? AND txn_id = ?
                 """,
-                threshold, rate, midTierThreshold, midTierFlatFee, runId, batch.getBatchNo());
-    }
-
-    public long applyDiscount(String runId, BatchRef batch, double threshold, double rate) {
-        return jdbc.update(
-                """
-                UPDATE processed_transactions
-                SET discount = ROUND(original_amount * CAST(? AS numeric), 2),
-                    adjustment = ROUND(original_amount * CAST(? AS numeric), 2) * -1,
-                    final_amount = ROUND(final_amount - (original_amount * CAST(? AS numeric)), 2)
-                WHERE run_id = ? AND batch_no = ? AND original_amount > CAST(? AS numeric)
-                """,
-                rate, rate, rate, runId, batch.getBatchNo(), threshold);
-    }
-
-    public long applyLateFees(String runId, BatchRef batch, int lateDays, double rate) {
-        Date cutoff = Date.valueOf(LocalDate.now().minusDays(lateDays));
-        return jdbc.update(
-                """
-                UPDATE processed_transactions p
-                SET penalty = ROUND(p.original_amount * CAST(? AS numeric), 2),
-                    final_amount = ROUND(p.final_amount + (p.original_amount * CAST(? AS numeric)), 2)
-                FROM billing_transactions t
-                WHERE p.run_id = ? AND p.batch_no = ? AND p.txn_id = t.txn_id AND t.due_date < ?
-                """,
-                rate, rate, runId, batch.getBatchNo(), cutoff);
+                rows,
+                500,
+                (ps, row) -> {
+                    ps.setBigDecimal(1, row.getAdjustment());
+                    ps.setBigDecimal(2, row.getDiscount());
+                    ps.setBigDecimal(3, row.getPenalty());
+                    ps.setBigDecimal(4, row.getFinalAmount());
+                    ps.setString(5, runId);
+                    ps.setString(6, row.getTxnId());
+                });
     }
 
     public long countGlEntries(BatchRef batch) {
@@ -289,7 +369,7 @@ public class BillingJdbc {
         return count == null ? 0 : count;
     }
 
-    public long matchTransactions(String runId, BatchRef batch, double tolerance, IntConsumer onProgress) {
+    public void deleteDiscrepanciesForBatch(String runId, BatchRef batch) {
         jdbc.update(
                 """
                 DELETE FROM discrepancies d
@@ -297,59 +377,63 @@ public class BillingJdbc {
                 WHERE d.run_id = ? AND p.run_id = ? AND p.batch_no = ? AND d.txn_id = p.txn_id
                 """,
                 runId, runId, batch.getBatchNo());
+    }
 
-        List<AmountRow> billing = jdbc.query(
-                """
-                SELECT txn_id, original_amount
-                FROM processed_transactions
-                WHERE run_id = ? AND batch_no = ?
-                """,
-                (rs, i) -> new AmountRow(rs.getString("txn_id"), rs.getDouble("original_amount")),
-                runId, batch.getBatchNo());
-        List<AmountRow> glRows = jdbc.query(
+    public Map<String, BigDecimal> loadGlAmountsForBatch(BatchRef batch) {
+        Map<String, BigDecimal> glByTxn = new HashMap<>();
+        List<Map.Entry<String, BigDecimal>> rows = jdbc.query(
                 """
                 SELECT g.txn_id, g.amount
                 FROM gl_entries g
                 JOIN billing_transactions t ON t.txn_id = g.txn_id
                 WHERE t.id BETWEEN ? AND ?
                 """,
-                (rs, i) -> new AmountRow(rs.getString("txn_id"), rs.getDouble("amount")),
+                (rs, i) -> Map.entry(rs.getString("txn_id"), rs.getBigDecimal("amount")),
                 batch.getFromId(), batch.getToId());
-
-        Map<String, Double> glByTxn = new HashMap<>();
-        for (AmountRow row : glRows) {
-            glByTxn.put(row.txnId(), row.amount());
+        for (Map.Entry<String, BigDecimal> row : rows) {
+            glByTxn.put(row.getKey(), row.getValue());
         }
-
-        List<Object[]> inserts = new ArrayList<>();
-        int scanned = 0;
-        for (AmountRow billed : billing) {
-            scanned++;
-            if (scanned % 10000 == 0 && onProgress != null) {
-                onProgress.accept(scanned);
-            }
-            Double glAmount = glByTxn.get(billed.txnId());
-            if (glAmount == null) {
-                inserts.add(new Object[]{runId, billed.txnId(), billed.amount(), 0.0, billed.amount(), "MISSING_GL", "N"});
-                continue;
-            }
-            double difference = Math.round((billed.amount() - glAmount) * 100.0) / 100.0;
-            if (Math.abs(difference) > tolerance) {
-                inserts.add(new Object[]{runId, billed.txnId(), billed.amount(), glAmount, difference, "AMOUNT_MISMATCH", "N"});
-            }
-        }
-        if (!inserts.isEmpty()) {
-            jdbc.batchUpdate(
-                    """
-                    INSERT INTO discrepancies (run_id, txn_id, billing_amount, gl_amount, difference, reason, compensated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    inserts);
-        }
-        return inserts.size();
+        return glByTxn;
     }
 
-    private record AmountRow(String txnId, double amount) {
+    public Map<String, BigDecimal> loadGlAmounts(List<String> txnIds) {
+        Map<String, BigDecimal> glByTxn = new HashMap<>();
+        if (txnIds == null || txnIds.isEmpty()) {
+            return glByTxn;
+        }
+        forEachInChunk(txnIds, chunk -> {
+            String ph = placeholders(chunk.size());
+            List<Map.Entry<String, BigDecimal>> rows = jdbc.query(
+                    "SELECT txn_id, amount FROM gl_entries WHERE txn_id IN (" + ph + ")",
+                    (rs, i) -> Map.entry(rs.getString("txn_id"), rs.getBigDecimal("amount")),
+                    chunk.toArray());
+            for (Map.Entry<String, BigDecimal> row : rows) {
+                glByTxn.put(row.getKey(), row.getValue());
+            }
+        });
+        return glByTxn;
+    }
+
+    public void insertDiscrepancies(String runId, List<DiscrepancyDto> discrepancies) {
+        if (discrepancies == null || discrepancies.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                """
+                INSERT INTO discrepancies (run_id, txn_id, billing_amount, gl_amount, difference, reason, compensated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                discrepancies,
+                500,
+                (ps, row) -> {
+                    ps.setString(1, runId);
+                    ps.setString(2, row.getTxnId());
+                    ps.setBigDecimal(3, row.getBillingAmount());
+                    ps.setBigDecimal(4, row.getGlAmount());
+                    ps.setBigDecimal(5, row.getDifference());
+                    ps.setString(6, row.getReason());
+                    ps.setString(7, "N");
+                });
     }
 
     public DiscrepancySummary discrepancySummary(String runId, BatchRef batch) {
@@ -373,38 +457,33 @@ public class BillingJdbc {
         return new DiscrepancySummary(txnIds.size(), amount == null ? 0 : amount, txnIds);
     }
 
-    /**
-     * Saga compensation for a GL mismatch: the ledger is the system of record, so the billing source
-     * amount is corrected to the GL amount for the flagged ids. Because the batch child re-runs the
-     * full pipeline (enrich re-reads {@code billing_transactions}) after this activity via
-     * Continue-As-New, the subsequent match finds no discrepancy. This is the demo's correction rule;
-     * Replace the body with your own reconciliation policy for production.
-     */
-    public long compensateDiscrepancies(String runId, List<String> txnIds) {
+    public void updateBillingAmounts(List<BillingAmountCorrection> corrections) {
+        if (corrections == null || corrections.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate(
+                "UPDATE billing_transactions SET amount = ? WHERE txn_id = ?",
+                corrections,
+                500,
+                (ps, correction) -> {
+                    ps.setBigDecimal(1, correction.getAmount());
+                    ps.setString(2, correction.getTxnId());
+                });
+    }
+
+    public void markDiscrepanciesCompensated(String runId, List<String> txnIds) {
         if (txnIds == null || txnIds.isEmpty()) {
-            return 0;
+            return;
         }
-        String placeholders = String.join(",", txnIds.stream().map(id -> "?").toList());
-        Object[] args = new Object[txnIds.size() + 1];
-        args[0] = runId;
-        for (int i = 0; i < txnIds.size(); i++) {
-            args[i + 1] = txnIds.get(i);
-        }
-        // Align the billing source to the ledger for the flagged ids (accept GL as truth).
-        int corrected = jdbc.update(
-                "UPDATE billing_transactions b "
-                        + "SET amount = g.amount "
-                        + "FROM gl_entries g "
-                        + "WHERE b.txn_id = g.txn_id AND b.txn_id IN (" + placeholders + ")",
-                java.util.Arrays.copyOfRange(args, 1, args.length));
-        jdbc.update(
-                "UPDATE processed_transactions SET adjustment = 0, discount = 0, penalty = 0, final_amount = original_amount "
-                        + "WHERE run_id = ? AND txn_id IN (" + placeholders + ")",
-                args);
-        jdbc.update(
-                "UPDATE discrepancies SET compensated = 'Y' WHERE run_id = ? AND txn_id IN (" + placeholders + ")",
-                args);
-        return corrected;
+        forEachInChunk(txnIds, chunk -> {
+            String ph = placeholders(chunk.size());
+            List<Object> args = new ArrayList<>();
+            args.add(runId);
+            args.addAll(chunk);
+            jdbc.update(
+                    "UPDATE discrepancies SET compensated = 'Y' WHERE run_id = ? AND txn_id IN (" + ph + ")",
+                    args.toArray());
+        });
     }
 
     public void saveReport(String runId, String name, String reportType, String content) {
@@ -539,5 +618,42 @@ public class BillingJdbc {
                 },
                 runId);
         return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private static BillingTransactionDto mapBillingTransaction(ResultSet rs) throws SQLException {
+        return new BillingTransactionDto(
+                rs.getLong("id"),
+                rs.getString("txn_id"),
+                rs.getString("vendor_id"),
+                rs.getString("customer_id"),
+                rs.getBigDecimal("amount"),
+                rs.getString("currency"));
+    }
+
+    private static ProcessedTransactionDto mapProcessed(ResultSet rs) throws SQLException {
+        Date due = rs.getDate("due_date");
+        return new ProcessedTransactionDto(
+                rs.getString("txn_id"),
+                rs.getString("vendor_name"),
+                rs.getString("customer_name"),
+                rs.getString("currency"),
+                rs.getBigDecimal("original_amount"),
+                rs.getBigDecimal("adjustment"),
+                rs.getBigDecimal("discount"),
+                rs.getBigDecimal("penalty"),
+                rs.getBigDecimal("final_amount"),
+                rs.getInt("batch_no"),
+                due == null ? null : due.toLocalDate());
+    }
+
+    private static String placeholders(int count) {
+        return String.join(",", java.util.Collections.nCopies(count, "?"));
+    }
+
+    private static void forEachInChunk(List<String> ids, java.util.function.Consumer<List<String>> consumer) {
+        final int chunkSize = 5000;
+        for (int i = 0; i < ids.size(); i += chunkSize) {
+            consumer.accept(ids.subList(i, Math.min(i + chunkSize, ids.size())));
+        }
     }
 }

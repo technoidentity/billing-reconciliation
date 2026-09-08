@@ -1,91 +1,151 @@
 # Billing Reconciliation
 
-Daily billing reconciliation: **1.2 million** transactions validated, enriched, scored against billing rules, and matched to the general ledger. Orchestration is **Temporal**; all I/O is **PostgreSQL**.
+Daily billing reconciliation orchestrated by **Temporal**. Transactions are validated, enriched, and priced in **Java activities**, matched to the general ledger, and held for operator resolution when amounts disagree.
 
-A single Spring Boot process hosts the REST API and the Temporal worker. The parent workflow fans out to **12 child workflows** (100K rows each). Children with GL mismatches wait for a resolution signal, then **Continue-As-New** and re-run the same pipeline against the current database.
+The demonstration scale is **1.2 million** rows, processed as **12 parallel child workflows** of 100,000 transactions. One Spring Boot process hosts the REST API and the worker. PostgreSQL stores source data and run artifacts.
 
-| Layer | Detail |
+| Component | Detail |
 | --- | --- |
-| Runtime | Java 17 · Spring Boot 3.3.5 · Temporal Java SDK 1.30.1 |
-| Data | PostgreSQL 16 (`billing`) |
-| Orchestration | Temporal Server (local) or Temporal Cloud |
-| Scale | 1.2M rows · 100K per child · 12 parallel children |
+| Language / runtime | Java 17, Spring Boot 3.3.5 |
+| Orchestration | Temporal Java SDK 1.30.1 (local server or Temporal Cloud) |
+| Database | PostgreSQL 16 (`billing`) |
+| Scale (default) | 1.2M rows · 100K per child · 12 concurrent children |
 | Task queue | `billing-reconciliation-queue` |
 
-**Contents:** [Architecture](#architecture) · [Quick start](#quick-start) · [End-to-end run](#end-to-end-run) · [Discrepancy resolution](#discrepancy-resolution) · [Schedule](#schedule) · [Configuration](#configuration) · [Demo scenario mapping](#demo-scenario-mapping) · [Dummy data](#dummy-data) · [API](#api) · [Demo script](#demo-script) · [Tests](#tests) · [Source map](#source-map)
+## Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Processing model](#processing-model)
+- [Workflow design](#workflow-design)
+- [Prerequisites](#prerequisites)
+- [Getting started](#getting-started)
+- [Running a reconciliation](#running-a-reconciliation)
+- [Discrepancy resolution](#discrepancy-resolution)
+- [Schedule](#schedule)
+- [Configuration](#configuration)
+- [Scenario mapping](#scenario-mapping)
+- [Sample data](#sample-data)
+- [HTTP API](#http-api)
+- [Demo script](#demo-script)
+- [Tests](#tests)
+- [Source layout](#source-layout)
+
+---
+
+## Overview
+
+Each run:
+
+1. Slices `billing_transactions` into batches.
+2. Validates schema in Java and records per-field failures.
+3. Enriches valid rows with vendor and customer data (HTTP, with a local-table fallback).
+4. Applies surcharge, discount, and late-fee rules in Java.
+5. Matches processed original amounts to general-ledger entries.
+6. Waits for `COMPENSATE` or `CONTINUE` when mismatches remain, then Continue-As-New and re-runs the pipeline.
+7. After every child completes, persists compliance reports, notification records, and an audit trail.
+
+**Workflows** orchestrate steps and stay deterministic. **Activities** execute I/O and business rules. **PostgreSQL** loads DTOs and persists results; it does not classify rows, compute fees, or decide mismatches.
+
+A step-by-step mapping to the 16-step scenario is in [`IMPLEMENTATION_COVERAGE.md`](IMPLEMENTATION_COVERAGE.md).
 
 ---
 
 ## Architecture
 
-Verified against `BillingReconciliationWorkflowImpl`, `BatchReconciliationWorkflowImpl`, `ReconciliationController`, and `docker-compose.yml`.
-
-**Runtime** — schedule and REST start work on Temporal; the worker polls the queue; activities hit billing Postgres (SQL) or loopback HTTP.
-
 ```
-  Temporal Schedule                 REST API
-  08:00 America/Chicago             POST /api/reconciliation/start
-  daily-billing-reconciliation      POST .../resolve  GET .../progress
-            |                                  |
-            |  Schedule start                  |  WorkflowClient
-            v                                  v
-  +---------------------- Temporal --------------------------------+
-  |  UI :8088 ------view-----> Server :7233                        |
-  |                              |              |                  |
-  |                         Task Queue          +-- Temporal PG    |
-  |                   billing-reconciliation-queue                 |
-  +------------------------------^---------------------------------+
-                                 | poll / complete
-  +------------------------------+---------------------------------+
-  |                    Spring Boot JVM :8080                       |
-  |   REST API   |   Temporal Worker   |   Mock enrichment HTTP    |
-  |              |                     |   /api/vendors/bulk       |
-  |              |                     |   /api/customers/bulk     |
-  +------+-------+----------+----------+-------------+-------------+
-         |                  |                        |
-         |  start/signal    |  SQL                   |  HTTP loopback
-         |  (to Temporal)   v                        v
-         |            +----------- Billing Postgres :5432 -----------+
-         |            |  billing_transactions  gl_entries            |
-         +----------->|  processed_transactions  discrepancies       |
-                      |  reports  notifications  audit_log           |
-                      +----------------------------------------------+
+                    Temporal Schedule                         REST API
+                    08:00 America/Chicago                     POST /api/reconciliation/start
+                    daily-billing-reconciliation              POST .../resolve
+                              |                                         |
+                              |  schedule start                         |  WorkflowClient
+                              v                                         v
+            +------------------------------- Temporal --------------------------------+
+            |  UI :8088  ──────────────►  Server :7233                                 |
+            |                                |                    |                    |
+            |                           Task queue                +── Temporal Postgres |
+            |                    billing-reconciliation-queue                          |
+            +--------------------------------^-----------------------------------------+
+                                             | poll / complete
+            +--------------------------------+-----------------------------------------+
+            |                         Spring Boot :8080                                |
+            |     REST API     |     Temporal worker     |     Mock enrichment HTTP    |
+            |                  |                         |     /api/vendors/bulk       |
+            |                  |                         |     /api/customers/bulk     |
+            +--------+---------+------------+------------+--------------+--------------+
+                     |                      |                           |
+                     |  start / signal      |  load / persist           |  loopback HTTP
+                     |                      v                           v
+                     |              +------ Billing PostgreSQL :5432 ------------------+
+                     +------------► |  billing_transactions   gl_entries               |
+                                    |  processed_transactions discrepancies            |
+                                    |  reports  notifications  audit_log               |
+                                    +--------------------------------------------------+
 ```
 
-**Workflows** — one parent per run; children `{parentId}-batch-{n}`; parent reports only after every child returns.
+| Port | Service |
+| --- | --- |
+| 8080 | Application REST API and worker |
+| 8088 | Temporal UI |
+| 7233 | Temporal gRPC |
+| 5432 | Billing PostgreSQL |
+
+---
+
+## Processing model
+
+Temporal activities load rows as DTOs, apply Java engines, then persist. Heartbeats are emitted about every 5,000 rows so long batches stay within activity heartbeat timeouts.
+
+| Concern | Java | PostgreSQL |
+| --- | --- | --- |
+| Schema validation | `SchemaValidator` | Status `VALID` / `INVALID` and `validation_errors` |
+| Vendor / customer fetch | Parallel bulk HTTP | Cache write; local `vendors` / `customers` fallback |
+| Enrichment | `RecordEnricher` | Upsert `processed_transactions` |
+| Surcharge, discount, late fee | `BillingRulesEngine` | Updated money columns |
+| GL match | `GlMatcher` | Insert `discrepancies` |
+| Compensation | `CompensationPolicy` | Billing amount aligned to GL |
+
+Lookups, batch slicing, counts, reports, and audit inserts remain SQL. They do not evaluate billing rules.
+
+GL match (`GlMatcher`) flags `MISSING_GL` or `AMOUNT_MISMATCH` when the absolute difference exceeds tolerance `0.01`. Match uses **original** processed amount, not the fee-adjusted final amount.
+
+---
+
+## Workflow design
+
+### Parent: `BillingReconciliationWorkflow`
+
+One parent execution per run. Child workflow ids are `{parentId}-batch-{n}`. Reporting and notification run only after every child returns.
 
 ```
   Schedule 08:00  or  POST /start
-              |
-              v
-  BillingReconciliationWorkflow          (long-running parent)
-              |
-              |  activities: startRun, listBatches
-              |
-              +-- spawn 12 children in parallel (max-parallel-batches=12)
-              |
-              |     BatchReconciliationWorkflow
-              |     {parentId}-batch-1   ...  {parentId}-batch-12
-              |     (100K txn ids each)
-              |
-              |     POST /batches/{childId}/resolve  ----+
-              |     POST /{parentId}/resolve (fan-out    |
-              |       to pendingChildIds only) ----------+--> child signal
-              |
-              |  wait until all children complete
-              |
-              v
-  generateReports -> notifyStakeholders -> completeRun
-  (reports / notifications / audit_log in billing Postgres)
+              │
+              ▼
+  BillingReconciliationWorkflow
+              │
+              │  startRun, listBatches
+              │
+              ├── spawn children (max-parallel-batches = 12)
+              │     BatchReconciliationWorkflow
+              │     {parentId}-batch-1  …  {parentId}-batch-12
+              │
+              │     POST /batches/{childId}/resolve  ──► child signal
+              │     POST /{parentId}/resolve         ──► fan-out to waiting children
+              │
+              │  wait for all children
+              ▼
+  generateReports → notifyStakeholders → completeRun
 ```
 
-**Child loop** — full pipeline every round; `COMPENSATE` writes billing:=GL then Continue-As-New; `CONTINUE` skips the write and re-reads the DB. Stops after `max-resolution-rounds` (10).
+### Child: `BatchReconciliationWorkflow`
+
+Every resolution round re-runs the full pipeline against current database state. `COMPENSATE` aligns flagged billing amounts to the ledger, then Continue-As-New. `CONTINUE` skips that write and re-reads the database. The loop stops after `max-resolution-rounds` (default 10).
 
 ```
   VALIDATE_SCHEMA
   HANDLE_VALIDATION_ERRORS
-  FETCH_VENDOR_DATA          --> HTTP /api/vendors/bulk   (fallback: vendors)
-  FETCH_CUSTOMER_DATA        --> HTTP /api/customers/bulk (fallback: customers)
+  FETCH_VENDOR_DATA            →  HTTP /api/vendors/bulk     (fallback: vendors)
+  FETCH_CUSTOMER_DATA          →  HTTP /api/customers/bulk   (fallback: customers)
   ENRICH_RECORDS
   APPLY_BILLING_RULES
   CALCULATE_ADJUSTMENTS
@@ -93,41 +153,36 @@ Verified against `BillingReconciliationWorkflowImpl`, `BatchReconciliationWorkfl
   QUERY_GL
   MATCH_TRANSACTIONS
   IDENTIFY_DISCREPANCIES
-            |
-            +-- 0 mismatches ----------------> COMPLETED ------------+
-            |                                                        |
-            +-- mismatches and round >= 10                           |
-            |     ----------------------> COMPLETED_WITH_UNRESOLVED -+
-            |                                                        |
-            +-- mismatches and round < 10                            |
-                  WAITING_FOR_SIGNAL                                 |
-                        |                                            |
-                        |  signal: COMPENSATE or CONTINUE            |
-                        |  optional txnId (else all flagged ids)     |
-                        |                                            |
-                        +-- COMPENSATE                               |
-                        |     compensateDiscrepancies                |
-                        |     billing_transactions.amount := GL      |
-                        |                                            |
-                        +-- CONTINUE                                 |
-                              (no auto-fix)                          |
-                        |                                            |
-                        v                                            |
-                  Continue-As-New                                    |
-                  same workflow id, round+1                          |
-                        |                                            |
-                        +---- back to VALIDATE_SCHEMA                |
-                                                                     v
-                                                            parent BatchResult
+            │
+            ├── no mismatches ────────────────────────────► COMPLETED
+            ├── mismatches and round ≥ 10 ────────────────► COMPLETED_WITH_UNRESOLVED
+            └── mismatches and round < 10
+                      WAITING_FOR_SIGNAL
+                            │
+                            │  COMPENSATE  →  CompensationPolicy, then Continue-As-New
+                            │  CONTINUE    →  Continue-As-New without auto-fix
+                            ▼
+                      round + 1, same workflow id, back to VALIDATE_SCHEMA
 ```
 
-
+Parent execution timeout is unbounded so a run can wait on human resolution. Each scheduled start creates a **new** parent execution.
 
 ---
 
-## Quick start
+## Prerequisites
 
-Postgres, Temporal, UI, and the app. App on **8080**, Temporal UI on **8088**.
+| Requirement | Notes |
+| --- | --- |
+| Docker and Docker Compose | PostgreSQL, Temporal, and (optional) the application image |
+| JDK 17 | Local `mvn` builds and tests |
+| Maven 3.9+ | `mvn test`, `mvn spring-boot:run` |
+| Temporal CLI (optional) | Workflow inspection; not required to start a run via REST |
+
+---
+
+## Getting started
+
+Start PostgreSQL, Temporal, the UI, and the application. The API listens on **8080**; Temporal UI on **8088**.
 
 ```bash
 docker compose up -d --build
@@ -135,20 +190,31 @@ docker compose up -d --build
 curl -X POST http://localhost:8080/api/reconciliation/start
 ```
 
-**Ports:** app REST API `:8080`, Temporal UI `:8088`, Temporal server `:7233`, Postgres `:5432`.
+Windows PowerShell:
 
-Already running a Temporal server elsewhere? Use the [demo script](#demo-script) instead — it starts only
-Postgres + the app (on `:8081` to avoid clashing with a Temporal UI on `:8080`) and drives the whole flow:
-
-```bash
-./scripts/demo.sh all          # up + data + run   (or: ./scripts/demo.sh  for a menu)
+```powershell
+docker compose up -d --build
+.\scripts\insert-dummy-data.ps1
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/reconciliation/start
 ```
 
-> Examples below use `:8080`. If you used `demo.sh`, substitute `:8081`.
+Rebuild the application image (`docker compose up -d --build`) after Java engine changes so the worker is not still running the previous SQL-based rules.
+
+If a Temporal server is already running elsewhere, use the [demo script](#demo-script). It starts only PostgreSQL and the application (default API port **8081**, so it does not collide with a Temporal UI on 8080):
+
+```bash
+./scripts/demo.sh all
+```
+
+```powershell
+.\scripts\demo.ps1 all
+```
+
+Examples below use port 8080. Substitute 8081 when using `demo.sh`.
 
 ---
 
-## End-to-end run
+## Running a reconciliation
 
 ```bash
 APP=http://localhost:8080/api/reconciliation
@@ -161,22 +227,21 @@ curl $APP/$WF/progress
 curl $APP/batches/$WF-batch-1/step
 curl $APP/batches/$WF-batch-1/problems
 
-# Auto-align every flagged id in the batch to the GL, then re-process
 curl -X POST $APP/batches/$WF-batch-1/resolve \
-  -H 'Content-Type: application/json' -d '{"decision":"COMPENSATE"}'
+  -H 'Content-Type: application/json' \
+  -d '{"decision":"COMPENSATE"}'
 
-# After all 12 children complete, the parent writes reports and notifications
 curl $APP/$WF/result
 ```
 
-1. `POST /start` starts `BillingReconciliationWorkflow`. `listBatches` splits the table by row count (`ceil(txns / batch-size)`).
-2. The parent starts 12 children in parallel (`max-parallel-batches`).
-3. Each child: validate → errors → vendor → customer → enrich → rules → adjustments → penalties → query GL → match → identify discrepancies.
-4. Clean children complete. Mismatched children set `WAITING_FOR_SIGNAL` and expose txn ids.
-5. A resolve signal Continue-As-News the child. The new run re-executes the pipeline; fixed ids drop off, remaining ids wait again.
-6. When every child is done, the parent runs reports, notify, and audit.
+1. `POST /start` starts `BillingReconciliationWorkflow`. `listBatches` partitions by row count: `ceil(transactions / batch-size)`.
+2. The parent starts children up to `max-parallel-batches` (default 12).
+3. Each child validates, enriches, applies billing rules, matches the GL, and identifies discrepancies.
+4. Clean children complete. Children with mismatches enter `WAITING_FOR_SIGNAL` and expose transaction ids.
+5. A resolve signal uses **Continue-As-New**. The new round re-executes the pipeline; corrected ids drop off.
+6. When every child is done, the parent writes reports, notifications, and audit rows.
 
-Resolving one batch only finishes that child. Steps 14–16 run on the **parent** after all children complete.
+Resolving one batch completes only that child. Reports and notifications run on the parent after all children finish.
 
 ---
 
@@ -184,79 +249,66 @@ Resolving one batch only finishes that child. Steps 14–16 run on the **parent*
 
 | Request | Scope | Behavior |
 | --- | --- | --- |
-| `{"decision":"COMPENSATE"}` | Entire batch | Compensation activity aligns every flagged billing amount to the GL, then Continue-As-New. |
-| `{"decision":"CONTINUE"}` | Entire batch | No auto-fix. Re-run against the current DB. Unfixed ids wait again. |
-| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Compensate `X` only; other ids reappear on the next run. |
-| `{"txnId":"X","decision":"CONTINUE"}` | One id | Re-check the DB for that id. |
-| Same body on the **parent** `/resolve` | Fan-out | Delivers the decision to every child still waiting. |
+| `{"decision":"COMPENSATE"}` | Entire batch | Align every flagged billing amount to the GL, then Continue-As-New. |
+| `{"decision":"CONTINUE"}` | Entire batch | Re-run against current data. Unfixed ids wait again. |
+| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Compensate `X` only. Other ids reappear on the next round. |
+| `{"txnId":"X","decision":"CONTINUE"}` | One id | Re-check that id. |
+| Same body on the parent `/resolve` | Fan-out | Deliver the decision to every child still waiting. |
 
-An empty body (`{}`) defaults to **COMPENSATE for the whole batch**. After a manual SQL fix, send `{"decision":"CONTINUE"}`.
-
-```bash
-# Manual fix, then re-check
-psql ... -c "UPDATE billing_transactions
-             SET amount = (SELECT amount FROM gl_entries WHERE txn_id='TXN0001050001')
-             WHERE txn_id='TXN0001050001';"
-
-curl -X POST $APP/batches/$WF-batch-11/resolve \
-  -H 'Content-Type: application/json' -d '{"decision":"CONTINUE"}'
-```
-
-Demo helpers (same effect without raw SQL):
+An empty body (`{}`) defaults to **COMPENSATE** for the whole batch. After a manual data correction, send `{"decision":"CONTINUE"}`.
 
 ```bash
 curl $APP/txns/TXN0001050001
 curl -X POST $APP/txns/TXN0001050001/correct -d '{}'
 curl -X POST $APP/batches/$WF-batch-11/resolve \
+  -H 'Content-Type: application/json' \
   -d '{"txnId":"TXN0001050001","decision":"CONTINUE"}'
 ```
 
-Signaling a Failed or Completed workflow returns HTTP 409 `NOT_RUNNING`.
-
-The parent execution is unbounded (`execution-timeout: 0`) so it can wait on human resolution. Each daily schedule start is a **new** parent execution. After resolve, the Temporal UI shows a `Continued as New` child run followed by `Completed` when the batch is clean.
+Signaling a failed or completed workflow returns HTTP 409 `NOT_RUNNING`. After resolve, Temporal UI shows a **Continued as New** child run, then **Completed** when the batch is clean.
 
 ---
 
 ## Schedule
 
-Registered at startup by [`ReconciliationScheduleConfig`](src/main/java/com/billing/reconciliation/config/ReconciliationScheduleConfig.java) (Temporal Schedule API).
+[`ReconciliationScheduleConfig`](src/main/java/com/billing/reconciliation/config/ReconciliationScheduleConfig.java) registers a Temporal Schedule at startup.
 
-| Key | Default | Meaning |
+| Key | Default | Description |
 | --- | --- | --- |
 | `billing.schedule.enabled` | `true` | Register on boot (`BILLING_SCHEDULE_ENABLED`) |
 | `billing.schedule.cron` | `0 8 * * *` | 08:00 |
 | `billing.schedule.timezone` | `America/Chicago` | Schedule timezone |
-| `billing.schedule.overlap-policy` | `BUFFER_ONE` | If yesterday’s run is still open at 08:00 |
+| `billing.schedule.overlap-policy` | `BUFFER_ONE` | If the previous run is still open at 08:00 |
 
-Overlap options: `BUFFER_ONE`, `SKIP`, `ALLOW_ALL`, `CANCEL_OTHER`, `TERMINATE_OTHER`. Manage the schedule in Temporal UI → **Schedules** → `daily-billing-reconciliation`.
+Overlap policies: `BUFFER_ONE`, `SKIP`, `ALLOW_ALL`, `CANCEL_OTHER`, `TERMINATE_OTHER`. Inspect the schedule in Temporal UI → **Schedules** → `daily-billing-reconciliation`.
 
 ---
 
 ## Configuration
 
-Knobs live in [`application.yaml`](src/main/resources/application.yaml) and are bound by [`BillingProperties`](src/main/java/com/billing/reconciliation/config/BillingProperties.java). Values are snapshotted into workflow input so timeouts and rules stay deterministic on replay.
+Settings live in [`application.yaml`](src/main/resources/application.yaml) and are bound by [`BillingProperties`](src/main/java/com/billing/reconciliation/config/BillingProperties.java). Values are copied into workflow input so timeouts and rule parameters stay deterministic on replay.
 
-| Area | Key defaults |
+| Area | Defaults |
 | --- | --- |
 | Batching | `batch-size` 100000, `max-parallel-batches` 12 |
 | Worker | 100 activity executors, 50 workflow-task executors |
 | Enrichment | 1000 concurrent calls, bulk chunk 200, 30s timeout, cache fallback |
-| Rules | surcharge 2% above 10000; mid-tier $5 above 1000; discount 5% above 5000; late fee 2% after 30 days |
-| Match | amount tolerance `0.01`; max resolution rounds `10` |
-| Timeouts | parent/child execution `0s` (unbounded); activities 15–30m with 2m heartbeat; retry 1s→16s ×2 |
+| Rules | Surcharge, discount, and late fee in [`application.yaml`](src/main/resources/application.yaml) |
+| Match | Amount tolerance `0.01`; max resolution rounds `10` |
+| Timeouts | Parent and child execution unbounded (`0s`); activities 15–30m with 2m heartbeat; retry 1s → 16s, coefficient 2 |
 
 ### Temporal connection
 
-| Env | Local | Cloud |
+| Variable | Local | Temporal Cloud |
 | --- | --- | --- |
 | `TEMPORAL_TARGET` | `127.0.0.1:7233` | `<ns>.<accountId>.tmprl.cloud:7233` |
 | `TEMPORAL_NAMESPACE` | `default` | `<namespace>.<accountId>` |
-| `TEMPORAL_ENABLE_HTTPS` / `TEMPORAL_TLS` | `false` | `true` (forced when `TEMPORAL_API_KEY` is set) |
+| `TEMPORAL_ENABLE_HTTPS` / `TEMPORAL_TLS` | `false` | `true` (also forced when `TEMPORAL_API_KEY` is set) |
 | `TEMPORAL_API_KEY` | empty | Cloud API key |
-| `TEMPORAL_IDENTITY` | SDK `host@pid` | optional worker label |
-| `TEMPORAL_TASK_QUEUE` | `billing-reconciliation-queue` | isolate queues if needed |
+| `TEMPORAL_IDENTITY` | SDK `host@pid` | Optional worker label |
+| `TEMPORAL_TASK_QUEUE` | `billing-reconciliation-queue` | Isolate queues if required |
 
-Cloud is config-only ([`TemporalClientConfig`](src/main/java/com/billing/reconciliation/config/TemporalClientConfig.java)). Do not put the API key in YAML.
+Cloud is configuration-only ([`TemporalClientConfig`](src/main/java/com/billing/reconciliation/config/TemporalClientConfig.java)). Do not store the API key in YAML.
 
 ```bash
 export TEMPORAL_TARGET=my-namespace.abc123.tmprl.cloud:7233
@@ -267,54 +319,60 @@ docker compose up -d --build
 
 ---
 
-## Demo scenario mapping
+## Scenario mapping
 
 | Step | Implementation |
 | --- | --- |
-| 1 Scheduled trigger 08:00 | Temporal Schedule |
-| 2 Read 1.2M in 100K batches | `IngestionActivities.listBatches` → 12 children |
-| 3 Validate schema | `IngestionActivities.validateSchema` |
-| 4 Validation errors (retry 1s–16s) | `handleValidationErrors` + activity retry |
-| 5–6 Vendor / customer | Parallel bulk HTTP, then local table fallback |
-| 7 Enrich | SQL merge into `processed_transactions` (idempotent) |
-| 8–10 Rules, discounts, late fees | `BillingRuleActivities` |
-| 11–12 Query GL, match | In-memory compare; writes `discrepancies` |
-| 13 Identify + resolve | Wait → COMPENSATE / CONTINUE → Continue-As-New |
-| 14–16 Reports, notify, audit | `ReportingActivities` → `reports`, `notifications`, `audit_log` |
+| 1. Scheduled trigger 08:00 | Temporal Schedule |
+| 2. Read 1.2M in 100K batches | `IngestionActivities.listBatches` → child workflows |
+| 3. Validate schema | `SchemaValidator` via `IngestionActivities.validateSchema` |
+| 4. Handle validation errors | `handleValidationErrors` with activity retry (1s–16s) |
+| 5–6. Vendor / customer | Parallel bulk HTTP, then local-table fallback |
+| 7. Enrich | `RecordEnricher`, idempotent upsert |
+| 8–10. Rules, discounts, late fees | `BillingRulesEngine` via `BillingRuleActivities` |
+| 11–12. Query GL, match | `GlMatcher`; persist `discrepancies` |
+| 13. Identify and resolve | Wait → `CompensationPolicy` or `CONTINUE` → Continue-As-New |
+| 14–16. Reports, notify, audit | `ReportingActivities` → `reports`, `notifications`, `audit_log` |
 
-Reports and notify persist in Postgres (no SFTP/SMTP/Teams webhook).
+Reports and notifications are stored in PostgreSQL. This demonstration does not send email, Teams webhooks, or SFTP files.
 
 ---
 
-## Dummy data
+## Sample data
 
 ```bash
 ./scripts/insert-dummy-data.sh            # 1,200,000 rows
 ./scripts/insert-dummy-data.sh 24000      # smaller set
 ```
 
-Applies [`scripts/migrate-schema.sql`](scripts/migrate-schema.sql), then inserts. Seeded anomalies:
-
-- GL mismatches on `id % 10000 = 1` (`gl amount + 417`) — one discrepancy per 100K batch.
-- Invalid rows `amount = 0` on every 5000th txn.
-
-```sql
-UPDATE gl_entries SET amount = amount + 417 WHERE txn_id IN ('TXN0000000002','TXN0000000003');
+```powershell
+.\scripts\insert-dummy-data.ps1
+.\scripts\insert-dummy-data.ps1 24000
 ```
 
-Database **`billing`** on `localhost:5432`, user `billing` / `billing`. Source tables: `billing_transactions`, `vendors`, `customers`, `gl_entries`. Run tables: `processed_transactions`, `discrepancies`, `reports`, `notifications`, `audit_log`, `validation_errors`, `reconciliation_runs`, `vendor_cache`, `customer_cache`.
+The script applies [`scripts/migrate-schema.sql`](scripts/migrate-schema.sql), then inserts. Seeded anomalies:
+
+- General-ledger mismatches on `id % 10000 = 1` (GL amount + 417) — one discrepancy per 100K batch.
+- Invalid rows with `amount = 0` on every 5,000th transaction.
+
+Database **`billing`** on `localhost:5432`, user `billing` / `billing`.
+
+| Kind | Tables |
+| --- | --- |
+| Source | `billing_transactions`, `vendors`, `customers`, `gl_entries` |
+| Run | `processed_transactions`, `discrepancies`, `reports`, `notifications`, `audit_log`, `validation_errors`, `reconciliation_runs`, `vendor_cache`, `customer_cache` |
 
 ---
 
-## API
+## HTTP API
 
-Base path `/api/reconciliation`.
+Base path: `/api/reconciliation`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/start` | Start a run (refuses an empty table) |
+| POST | `/start` | Start a run (rejected if the table is empty) |
 | GET | `/{workflowId}/progress` | Parent progress and child ids |
-| GET | `/{workflowId}/result` | Final result (blocks until complete) |
+| GET | `/{workflowId}/result` | Final result (waits until complete) |
 | POST | `/{workflowId}/resolve` | Fan a decision to waiting children |
 | GET | `/batches/{childWorkflowId}/step` | Child current step |
 | GET | `/batches/{childWorkflowId}/problems` | Child discrepancy ids |
@@ -322,34 +380,36 @@ Base path `/api/reconciliation`.
 | GET | `/runs/{runId}` | Persisted run row |
 | GET | `/txns/{txnId}` | Demo: billing vs GL |
 | POST | `/txns/{txnId}/correct` | Demo: `{}` aligns to GL; `{"amount":n}` sets a value |
-| POST | `/api/vendors/bulk`, `/api/customers/bulk` | Mock enrichment |
+| POST | `/api/vendors/bulk`, `/api/customers/bulk` | Mock enrichment endpoints |
 | GET | `/actuator/health` | Health |
 
 ---
 
 ## Demo script
 
-[`scripts/demo.sh`](scripts/demo.sh) drives the whole demo — subcommands (also `--up`, `--run`, …) or an
-interactive menu when run with no arguments. It starts Postgres + the app and assumes a Temporal server is
-reachable at `$TEMPORAL_TARGET`.
+[`scripts/demo.sh`](scripts/demo.sh) (Linux/macOS) and [`scripts/demo.ps1`](scripts/demo.ps1) (Windows PowerShell) drive a full demonstration. With no arguments they show a menu; subcommands also accept `--up`, `--run`, and similar flags. They start PostgreSQL and the application and expect Temporal at `$TEMPORAL_TARGET` / `$env:TEMPORAL_TARGET`.
 
 | Command | Action |
 | --- | --- |
-| `up` | Start Postgres + app (worker + API) |
+| `up` | Start PostgreSQL and the application (worker + API) |
 | `data` | Load `ROWS` rows |
-| `run` | Trigger a run; print the workflow id, a UI link, and the waiting children |
-| `status` | Stack health + current-run progress |
-| `resolve` | Interactive: whole-batch COMPENSATE/CONTINUE, a single id, DB-correct + CONTINUE, or parent fan-out |
-| `restart` | Restart the app (worker + API); durable workflows resume |
-| `stop` / `down` | Stop app + Postgres / also wipe the volume |
+| `run` | Start a run; print workflow id, UI link, and waiting children |
+| `status` | Stack health and current-run progress |
+| `resolve` | Interactive: batch COMPENSATE/CONTINUE, a single id, correct-then-CONTINUE, or parent fan-out |
+| `restart` | Restart the application; durable workflows resume |
+| `stop` / `down` | Stop the application and PostgreSQL / also remove the volume |
 | `all` | `up` + `data` + `run` |
 
-Overridable env (defaults are production-like): `ROWS` (1200000), `BATCH_SIZE` (100000), `MAX_PARALLEL` (12),
-`APP_PORT` (8081), `TEMPORAL_TARGET`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_UI`.
+Overridable environment (production-like defaults): `ROWS` (1200000), `BATCH_SIZE` (100000), `MAX_PARALLEL` (12), `APP_PORT` (8081), `TEMPORAL_TARGET`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_UI`.
 
 ```bash
-./scripts/demo.sh all                       # full run
-ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh all   # fast demo, still 12 children
+./scripts/demo.sh all
+ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh all
+```
+
+```powershell
+.\scripts\demo.ps1 all
+$env:ROWS=24000; $env:BATCH_SIZE=2000; .\scripts\demo.ps1 all
 ```
 
 ---
@@ -360,20 +420,72 @@ ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh all   # fast demo, still 12 childre
 mvn test
 ```
 
-In-memory Temporal test environment (no Docker): happy path, whole-batch COMPENSATE / CONTINUE, and per-id Continue-As-New — [`BillingReconciliationWorkflowTest`](src/test/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowTest.java).
+| Suite | Coverage |
+| --- | --- |
+| [`BillingReconciliationWorkflowTest`](src/test/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowTest.java) | In-memory Temporal: happy path, batch COMPENSATE / CONTINUE, per-id Continue-As-New |
+| [`SchemaValidatorTest`](src/test/java/com/billing/reconciliation/engine/SchemaValidatorTest.java) | Per-field schema rules |
+| [`RecordEnricherTest`](src/test/java/com/billing/reconciliation/engine/RecordEnricherTest.java) | Vendor / customer merge |
+| [`BillingRulesEngineTest`](src/test/java/com/billing/reconciliation/engine/BillingRulesEngineTest.java) | Surcharge, discount, late fee |
+| [`GlMatcherTest`](src/test/java/com/billing/reconciliation/engine/GlMatcherTest.java) | Missing GL and amount mismatch |
+| [`CompensationPolicyTest`](src/test/java/com/billing/reconciliation/engine/CompensationPolicyTest.java) | Align billing to GL and reset processed amounts |
 
 ---
 
-## Source map
+## Source layout
 
-| Concern | Path |
+Paths are under `src/main/java/com/billing/reconciliation/` unless noted.
+
+### Configuration and stack
+
+| Item | Path |
 | --- | --- |
-| Config | [`src/main/resources/application.yaml`](src/main/resources/application.yaml) |
+| Application settings | [`src/main/resources/application.yaml`](src/main/resources/application.yaml) |
 | Property binding | [`config/BillingProperties.java`](src/main/java/com/billing/reconciliation/config/BillingProperties.java) |
 | Daily schedule | [`config/ReconciliationScheduleConfig.java`](src/main/java/com/billing/reconciliation/config/ReconciliationScheduleConfig.java) |
 | Temporal Cloud / TLS | [`config/TemporalClientConfig.java`](src/main/java/com/billing/reconciliation/config/TemporalClientConfig.java) |
+| Compose stack | [`docker-compose.yml`](docker-compose.yml) |
+| Database schema | [`docker/postgres/init.sql`](docker/postgres/init.sql) |
+
+### Workflows and API
+
+| Item | Path |
+| --- | --- |
 | Parent workflow | [`workflow/BillingReconciliationWorkflowImpl.java`](src/main/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowImpl.java) |
 | Child workflow | [`workflow/BatchReconciliationWorkflowImpl.java`](src/main/java/com/billing/reconciliation/workflow/BatchReconciliationWorkflowImpl.java) |
 | REST API | [`api/ReconciliationController.java`](src/main/java/com/billing/reconciliation/api/ReconciliationController.java) |
-| SQL | [`db/BillingJdbc.java`](src/main/java/com/billing/reconciliation/db/BillingJdbc.java) |
-| Schema | [`docker/postgres/init.sql`](docker/postgres/init.sql) |
+| Workflow / API models | [`model/`](src/main/java/com/billing/reconciliation/model) (`BatchRef`, `StepResult`, `ReconciliationRequest`, …) |
+
+### Activities
+
+| Item | Path |
+| --- | --- |
+| Ingestion | [`activity/IngestionActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/IngestionActivitiesImpl.java) |
+| Enrichment | [`activity/EnrichmentActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/EnrichmentActivitiesImpl.java) |
+| Billing rules | [`activity/BillingRuleActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/BillingRuleActivitiesImpl.java) |
+| Reconciliation | [`activity/ReconciliationActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/ReconciliationActivitiesImpl.java) |
+| Compensation | [`activity/CompensationActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/CompensationActivitiesImpl.java) |
+| Reporting | [`activity/ReportingActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/ReportingActivitiesImpl.java) |
+
+### Java engines
+
+All business rules live in [`engine/`](src/main/java/com/billing/reconciliation/engine): `SchemaValidator`, `RecordEnricher`, `BillingRulesEngine`, `GlMatcher`, `CompensationPolicy`.
+
+### DTOs
+
+Row and enrichment payloads used by activities and persistence. Package: [`dto/`](src/main/java/com/billing/reconciliation/dto).
+
+| DTO | Used for |
+| --- | --- |
+| `BillingTransactionDto` | Schema validation |
+| `ValidationErrorDto` | Per-field validation failures |
+| `VendorDto` / `CustomerDto` | Enrichment HTTP and cache |
+| `ProcessedTransactionDto` | Enrichment and billing rules |
+| `DiscrepancyDto` | GL match results |
+| `BillingAmountCorrection` | Compensation (align billing to GL) |
+
+### Persistence
+
+| Item | Path |
+| --- | --- |
+| JDBC load / persist | [`db/BillingJdbc.java`](src/main/java/com/billing/reconciliation/db/BillingJdbc.java) |
+

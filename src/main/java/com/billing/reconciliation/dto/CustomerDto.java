@@ -1,4 +1,4 @@
-package com.billing.reconciliation.model;
+package com.billing.reconciliation.dto;
 
 public class CustomerDto {
 

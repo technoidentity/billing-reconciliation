@@ -1,8 +1,8 @@
 package com.billing.reconciliation.api;
 
 import com.billing.reconciliation.db.BillingJdbc;
-import com.billing.reconciliation.model.CustomerDto;
-import com.billing.reconciliation.model.VendorDto;
+import com.billing.reconciliation.dto.CustomerDto;
+import com.billing.reconciliation.dto.VendorDto;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;

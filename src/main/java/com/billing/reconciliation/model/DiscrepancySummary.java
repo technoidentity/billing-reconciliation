@@ -12,10 +12,6 @@ public class DiscrepancySummary {
     public DiscrepancySummary() {
     }
 
-    public DiscrepancySummary(long count, double amount) {
-        this(count, amount, new ArrayList<>());
-    }
-
     public DiscrepancySummary(long count, double amount, List<String> txnIds) {
         this.count = count;
         this.amount = amount;
