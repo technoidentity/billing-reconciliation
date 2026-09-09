@@ -1,12 +1,12 @@
-# Temporal Billing Reconciliation Implementation Coverage
+# Temporal Transactions Reconciliation Implementation Coverage
 
-This document maps the current implementation to the 16-step Temporal workflow described in the billing reconciliation PDF.
+This document maps the current implementation to the 16-step Temporal workflow described in the Transactions reconciliation PDF.
 
 The PDF is treated as the scenario specification. Its Azure Logic Apps and hybrid-architecture sections are treated as alternatives or recommendations, not mandatory requirements for this Temporal-only implementation.
 
 ## Coverage summary
 
-The implementation covers the complete Temporal orchestration path: scheduled start, batching, child workflows, validation, enrichment, billing calculations, GL reconciliation, discrepancy resolution, Continue-As-New, reporting, notification, audit logging, and completion.
+The implementation covers the core Temporal orchestration path: scheduled start, batching, child workflows, validation, enrichment, billing calculations, GL reconciliation, discrepancy handling, Continue-As-New, reporting, notification, audit logging, and completion. It is a self-contained demo implementation, not a complete production realization of every integration and output format described in the PDF.
 
 Business logic now lives in a **pure-Java `engine` layer** (no JDBC), separate from persistence. Each activity follows a **load → compute → persist** pattern: `BillingJdbc` loads rows as DTOs, an engine computes the result in memory, and `BillingJdbc` persists it. Long 100K batches are processed in ~5,000-row chunks (`Heartbeats.CHUNK`) so activities keep heartbeating. The engines are independently unit-tested.
 
@@ -38,9 +38,9 @@ Several integrations are intentionally represented by local PostgreSQL persisten
 | 10. Apply penalties and late fees | Covered as-is | `applyPenalties` runs `BillingRulesEngine.applyLateFees` against a cutoff of `LocalDate.now().minusDays(lateDays)`. | The cutoff uses the activity host date (activity-side, outside workflow determinism). |
 | 11. Query General Ledger | Covered with variation | `ReconciliationActivities.queryGeneralLedger` reads GL rows from PostgreSQL. | PostgreSQL `gl_entries` stands in for the external GL system. |
 | 12. Match transactions with GL | Covered as-is | `matchTransactions` loads processed rows + a `txn → gl amount` map and compares them in memory via `GlMatcher.match` (`MISSING_GL` / `AMOUNT_MISMATCH`), persisting results with `insertDiscrepancies`. | In-memory matching after SQL reads. |
-| 13. Identify and resolve discrepancies | Covered with variation | `identifyDiscrepancies` returns problem ids. Children wait for `COMPENSATE`/`CONTINUE` and Continue-As-New. `CompensationPolicy` builds billing→GL corrections and resets processed money; `BillingJdbc` persists them. | The PDF suggests automatic Saga compensation; this implementation requires a human/API signal before compensation or re-check. |
-| 14. Generate compliance reports | Covered with variation / mocked output | `ReportingActivities.generateReports` stores a compliance CSV and an Excel-compatible CSV in the `reports` table. | No actual PDF/XLSX files or file delivery. |
-| 15. Notify stakeholders | Covered with variation / mocked output | `notifyStakeholders` records email and Teams notification intents in `notifications`. | No SMTP, Microsoft Graph, Teams webhook, or Logic Apps connector sends messages. |
+| 13. Identify and resolve discrepancies | Partially covered / manual variation | `identifyDiscrepancies` returns problem ids. Children wait for `COMPENSATE`/`CONTINUE` and Continue-As-New. `CompensationPolicy` builds billing→GL corrections and resets processed money; `BillingJdbc` persists them. | The PDF describes automatic Saga compensation. This implementation pauses for a human/API signal before compensation or re-check, so it is not automatic rollback. |
+| 14. Generate compliance reports | Partially covered / mocked output | `ReportingActivities.generateReports` stores a compliance CSV and an Excel-compatible CSV in the `reports` table. | The PDF calls for PDF/Excel files. No actual PDF/XLSX files, file delivery, or external reporting service is implemented. |
+| 15. Notify stakeholders | Partially covered / mocked output | `notifyStakeholders` records email and Teams notification intents in `notifications`. | The PDF calls for sending email/Teams messages. No SMTP, Microsoft Graph, Teams webhook, or Logic Apps connector sends messages. |
 | 16. Log audit trail and complete | Covered as-is | `logAuditTrail` and `completeRun` persist audit and run-completion records; Temporal persists workflow history/state. | Audit delivery is database-backed rather than an external platform. |
 
 ## Temporal-specific functions covered
@@ -49,6 +49,7 @@ Several integrations are intentionally represented by local PostgreSQL persisten
 - Child `BatchReconciliationWorkflow` executes the full reconciliation pipeline for each batch.
 - Child workflows use stable IDs of the form `{parentWorkflowId}-batch-{batchNo}`.
 - Parent concurrency is configurable through `max-parallel-batches`, defaulting to 12.
+- Vendor and customer requests are parallelized within their respective activities, but the workflow invokes those two phases sequentially rather than concurrently.
 - Child discrepancy resolution supports whole-batch and single-transaction targeting.
 - Parent resolution fans a decision out to currently pending children only (completed children are not signaled).
 - `Continue-As-New` carries the round, compensation state, and original discrepancy IDs while re-reading current database state.
@@ -67,18 +68,20 @@ The following functions are present to make the demonstration self-contained and
 - PostgreSQL `billing_transactions` represents the data warehouse source.
 - PostgreSQL `gl_entries` represents the General Ledger source.
 - `CompensationPolicy` updates billing amounts to the GL amount. This is a demo correction policy, not a confirmed production business policy.
-- Reports are CSV text stored in the database; the `.xlsx.csv` naming is Excel-compatible output, not an actual XLSX workbook.
+- Reports are CSV text stored in the database; the `.xlsx.csv` naming is Excel-compatible output, not an actual XLSX workbook, and no PDF is generated.
 - Notifications are database rows representing email/Teams delivery; no external messages are sent.
 - Dummy-data scripts create the 1.2M-row-scale dataset and seeded invalid rows/mismatches.
 - `/txns/{txnId}/correct` is a demo helper for changing billing data before sending a `CONTINUE` resolution.
 
 ## Material deviations from the PDF
 
-1. **Manual discrepancy resolution:** mismatches pause for an external signal instead of being automatically compensated.
-2. **Report format:** CSV and Excel-compatible CSV replace actual PDF/Excel file generation.
+1. **Manual discrepancy resolution:** mismatches pause for an external signal instead of being automatically compensated by a Saga.
+2. **Report format:** CSV and Excel-compatible CSV replace actual PDF/Excel file generation and delivery.
 3. **Notification delivery:** database notification records replace real email/Teams delivery.
 4. **Data sources:** local PostgreSQL replaces the data warehouse and external GL system.
-5. **Integration architecture:** the current implementation is Temporal plus local/mock services; it does not implement the PDF's optional Azure Logic Apps hybrid architecture.
+5. **Enrichment phase concurrency:** vendor and customer activities run one after the other at workflow level, although each activity makes bounded parallel calls internally.
+6. **Date input:** late-fee cutoff uses `LocalDate.now()` inside an activity, so the value is not a workflow-controlled input and may vary across retries on different dates.
+7. **Integration architecture:** the current implementation is Temporal plus local/mock services; it does not implement the PDF's optional Azure Logic Apps hybrid architecture.
 
 ## Verification
 
