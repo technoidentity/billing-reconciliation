@@ -47,7 +47,7 @@ $env:APP_PORT = "8081"
 | `TEMPORAL_API_KEY` | empty | Optional Temporal Cloud API key. |
 | `TEMPORAL_ENABLE_HTTPS` | `false` | Enables HTTPS/TLS configuration. |
 | `TEMPORAL_IDENTITY` | empty | Optional Temporal client identity. |
-| `TEMPORAL_UI` | `http://localhost:8080` | Base URL used for the printed Temporal UI link. |
+| `TEMPORAL_UI` | `http://localhost:8088` | Base URL used for the printed Temporal UI link. |
 
 The child count is `ceil(ROWS / BATCH_SIZE)`. For example, 24,000 rows with a batch size of 2,000 creates 12 child workflows.
 
