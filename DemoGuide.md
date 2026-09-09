@@ -38,7 +38,7 @@ $env:APP_PORT = "8081"
 
 | Variable | Default | Effect |
 |---|---:|---|
-| `APP_PORT` | `8081` | Application REST/health port. |
+| `APP_PORT` | `8080` | Application REST/health port. |
 | `ROWS` | `1200000` | Dummy transactions loaded by `data`. |
 | `BATCH_SIZE` | `100000` | Transactions per child workflow. |
 | `MAX_PARALLEL` | `12` | Maximum parallel batch setting passed to the app. |
