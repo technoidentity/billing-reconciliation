@@ -139,7 +139,7 @@ One parent execution per run. Child workflow ids are `{parentId}-batch-{n}`. Rep
 
 ### Child: `BatchReconciliationWorkflow`
 
-Every resolution round re-runs the full pipeline against current database state. `COMPENSATE` aligns flagged billing amounts to the ledger, then Continue-As-New. `CONTINUE` skips that write and re-reads the database. The loop stops after `max-resolution-rounds` (default 10).
+Every resolution round re-runs the full pipeline against current database state. `COMPENSATE` computes billing-to-GL corrections in Java memory, then persists them to PostgreSQL: it updates billing amounts, resets processed adjustment/discount/penalty/final-amount fields, and marks discrepancies compensated. The child then uses Continue-As-New to re-read those database changes and rerun the pipeline. `CONTINUE` skips compensation writes and re-reads the database. The loop stops after `max-resolution-rounds` (default 10).
 
 ```
   VALIDATE_SCHEMA
@@ -249,9 +249,9 @@ Resolving one batch completes only that child. Reports and notifications run on 
 
 | Request | Scope | Behavior |
 | --- | --- | --- |
-| `{"decision":"COMPENSATE"}` | Entire batch | Align every flagged billing amount to the GL, then Continue-As-New. |
+| `{"decision":"COMPENSATE"}` | Entire batch | Compute corrections in memory, persist flagged billing amounts aligned to GL in PostgreSQL, reset processed money, mark discrepancies compensated, then Continue-As-New. |
 | `{"decision":"CONTINUE"}` | Entire batch | Re-run against current data. Unfixed ids wait again. |
-| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Compensate `X` only. Other ids reappear on the next round. |
+| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Persist compensation for `X` only, reset its processed money, mark it compensated, then Continue-As-New. Other ids reappear on the next round. |
 | `{"txnId":"X","decision":"CONTINUE"}` | One id | Re-check that id. |
 | Same body on the parent `/resolve` | Fan-out | Deliver the decision to every child still waiting. |
 
