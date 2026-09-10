@@ -74,8 +74,18 @@ public class ReconciliationController {
         if (notification == null || notification.getFileName() == null || notification.getFileName().isBlank()) {
             return ResponseEntity.badRequest().body(Map.of("status", "INVALID", "message", "fileName is required"));
         }
-        boolean async = notification.getAsync() != null
-                ? notification.getAsync() : properties.getFiles().isAsyncCopy();
+        // A correction is ready by definition, so retryCorrectedFile copies synchronously (the corrected
+        // file + sidecar are fully in destination before re-validation) — this avoids a race where the
+        // async copy hasn't overwritten a stale destination copy yet and the non-retryable HashMismatch
+        // fires against old bytes. Async (default) is for the initial large-file landing / durability.
+        boolean async;
+        if (notification.getAsync() != null) {
+            async = notification.getAsync();
+        } else if ("retryCorrectedFile".equals(signalName)) {
+            async = false;
+        } else {
+            async = properties.getFiles().isAsyncCopy();
+        }
 
         // Async: start the copy in the background and signal at the same time. The workflow's locate
         // activity retries until the (large) file lands. A missing/mistyped file surfaces as the locate
