@@ -1,24 +1,15 @@
 package com.billing.reconciliation.config;
 
-import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowClientOptions;
-import io.temporal.client.schedules.ScheduleClient;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
 import io.temporal.spring.boot.TemporalOptionsCustomizer;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.util.StringUtils;
 
 @Configuration
 public class TemporalClientConfig {
-
-    @Bean
-    @ConditionalOnMissingBean
-    public ScheduleClient scheduleClient(WorkflowClient workflowClient) {
-        return ScheduleClient.newInstance(workflowClient.getWorkflowServiceStubs());
-    }
 
     /**
      * Worker identity shown in Temporal UI. Not a starter property, so applied here.

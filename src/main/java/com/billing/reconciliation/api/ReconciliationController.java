@@ -1,9 +1,12 @@
 package com.billing.reconciliation.api;
 
 import com.billing.reconciliation.config.BillingProperties;
-import com.billing.reconciliation.db.BillingJdbc;
+import com.billing.reconciliation.file.FileIds;
+import com.billing.reconciliation.file.InboundFileTransfer;
+import com.billing.reconciliation.file.ReconciliationFileStore;
+import com.billing.reconciliation.model.CoordinatorState;
 import com.billing.reconciliation.model.DiscrepancySummary;
-import com.billing.reconciliation.model.ReconciliationRequest;
+import com.billing.reconciliation.model.FileNotification;
 import com.billing.reconciliation.model.ReconciliationResult;
 import com.billing.reconciliation.model.ResolveRequest;
 import com.billing.reconciliation.model.WorkflowProgress;
@@ -24,10 +27,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Duration;
-import java.time.LocalDate;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @RestController
 @RequestMapping("/api/reconciliation")
@@ -35,45 +38,98 @@ public class ReconciliationController {
 
     private final WorkflowClient workflowClient;
     private final BillingProperties properties;
-    private final BillingJdbc jdbc;
+    private final ReconciliationFileStore files;
+    private final InboundFileTransfer transfer;
+    private final ExecutorService copyExecutor = Executors.newCachedThreadPool();
 
-    public ReconciliationController(WorkflowClient workflowClient, BillingProperties properties, BillingJdbc jdbc) {
+    public ReconciliationController(WorkflowClient workflowClient, BillingProperties properties,
+                                    ReconciliationFileStore files, InboundFileTransfer transfer) {
         this.workflowClient = workflowClient;
         this.properties = properties;
-        this.jdbc = jdbc;
+        this.files = files;
+        this.transfer = transfer;
     }
 
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> start() {
-        long txnCount = jdbc.countTransactions();
-        int batchSize = Math.max(1, properties.getBatchSize());
-        long expectedBatches = txnCount == 0 ? 0 : ((txnCount + batchSize - 1) / batchSize);
-        if (txnCount == 0) {
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("status", "NO_TRANSACTIONS");
-            body.put("txnCount", 0);
-            body.put("expectedBatches", 0);
-            body.put("message", "billing_transactions is empty. Run ./scripts/insert-dummy-data.sh, wait for it to finish, then start again.");
-            return ResponseEntity.badRequest().body(body);
-        }
-        String workflowId = properties.getSchedule().getWorkflowIdPrefix()
-                + "-" + LocalDate.now() + "-" + UUID.randomUUID().toString().substring(0, 8);
-        ReconciliationRequest request = properties.toWorkflowRequest();
-        WorkflowOptions.Builder options = WorkflowOptions.newBuilder()
-                .setWorkflowId(workflowId)
-                .setTaskQueue(properties.getTaskQueue())
-                .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE);
-        if (request.getWorkflowExecutionTimeoutSeconds() > 0) {
-            options.setWorkflowExecutionTimeout(Duration.ofSeconds(request.getWorkflowExecutionTimeoutSeconds()));
-        }
-        BillingReconciliationWorkflow stub = workflowClient.newWorkflowStub(
-                BillingReconciliationWorkflow.class, options.build());
-        WorkflowClient.start(stub::run, request);
+        String workflowId = startCoordinator();
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("workflowId", workflowId);
-        body.put("status", "STARTED");
-        body.put("txnCount", txnCount);
-        body.put("expectedBatches", expectedBatches);
+        body.put("status", "RUNNING");
+        body.put("message", "Long-running coordinator is active. Signal a file with POST /files/available.");
+        return ResponseEntity.ok(body);
+    }
+
+    @PostMapping("/files/available")
+    public ResponseEntity<Map<String, Object>> fileAvailable(@RequestBody FileNotification notification) {
+        return copyThenSignal("fileAvailable", notification);
+    }
+
+    @PostMapping("/files/retry")
+    public ResponseEntity<Map<String, Object>> retryCorrectedFile(@RequestBody FileNotification notification) {
+        return copyThenSignal("retryCorrectedFile", notification);
+    }
+
+    private ResponseEntity<Map<String, Object>> copyThenSignal(String signalName, FileNotification notification) {
+        if (notification == null || notification.getFileName() == null || notification.getFileName().isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("status", "INVALID", "message", "fileName is required"));
+        }
+        boolean async = notification.getAsync() != null
+                ? notification.getAsync() : properties.getFiles().isAsyncCopy();
+
+        // Async: start the copy in the background and signal at the same time. The workflow's locate
+        // activity retries until the (large) file lands. A missing/mistyped file surfaces as the locate
+        // activity failing (red), and the coordinator parks it — a good failure demo.
+        if (async) {
+            final FileNotification copyRequest = notification;
+            final long delaySeconds = properties.getFiles().getCopyDelaySeconds();
+            copyExecutor.submit(() -> {
+                try {
+                    if (delaySeconds > 0) {
+                        Thread.sleep(delaySeconds * 1000L);
+                    }
+                    transfer.copyHomeToDestination(copyRequest);
+                } catch (Exception ignored) {
+                    // Copy failure is intentional signal-noise here: the workflow's locate activity will
+                    // fail (red) and the file will wait for correction.
+                }
+            });
+            String workflowId = signalWithStart(signalName, notification);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("workflowId", workflowId);
+            body.put("fileName", notification.getFileName());
+            body.put("status", "SIGNALED");
+            body.put("signal", signalName);
+            body.put("mode", "async");
+            body.put("message", "Copy started in background; coordinator signaled concurrently. "
+                    + "locate/validate retries until the file lands.");
+            return ResponseEntity.ok(body);
+        }
+
+        // Sync (default): copy fully, then signal → locate finds the file immediately.
+        var copied = transfer.copyHomeToDestination(notification);
+        if (!copied.isValid()) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("status", "COPY_FAILED");
+            body.put("fileName", notification.getFileName());
+            body.put("message", copied.getMessage());
+            return ResponseEntity.badRequest().body(body);
+        }
+        if (copied.getGlFileName() != null && !copied.getGlFileName().isBlank()) {
+            notification.setGlFileName(copied.getGlFileName());
+        }
+        // Do NOT set expectedSha256 from the copied file — integrity is validated against the producer's
+        // sidecar (independent reference), not a hash the API recomputed from the same bytes.
+        String workflowId = signalWithStart(signalName, notification);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("workflowId", workflowId);
+        body.put("fileName", notification.getFileName());
+        body.put("sha256", copied.getComputedSha256());
+        body.put("fileId", FileIds.fromSha256(copied.getComputedSha256()));
+        body.put("status", "SIGNALED");
+        body.put("signal", signalName);
+        body.put("mode", "sync");
+        body.put("message", "Copied home → destination, then signaled. Integrity is validated against the sidecar.");
         return ResponseEntity.ok(body);
     }
 
@@ -89,16 +145,21 @@ public class ReconciliationController {
             @PathVariable String workflowId,
             @RequestBody(required = false) ResolveRequest body) {
         String decision = body == null ? "COMPENSATE" : body.getDecision();
+        if (!"COMPENSATE".equalsIgnoreCase(decision)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "status", "REJECTED",
+                    "message", "Discrepancy resolution uses COMPENSATE only."));
+        }
         try {
             BillingReconciliationWorkflow stub = workflowClient.newWorkflowStub(
                     BillingReconciliationWorkflow.class, workflowId);
-            stub.resolveDiscrepancies(decision);
+            stub.resolveDiscrepancies("COMPENSATE");
         } catch (WorkflowNotFoundException ex) {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(closedWorkflow(workflowId, decision));
         }
         Map<String, String> response = new LinkedHashMap<>();
         response.put("workflowId", workflowId);
-        response.put("decision", decision);
+        response.put("decision", "COMPENSATE");
         response.put("status", "SIGNALED");
         return ResponseEntity.ok(response);
     }
@@ -124,21 +185,26 @@ public class ReconciliationController {
     public ResponseEntity<Map<String, String>> resolveBatch(
             @PathVariable String childWorkflowId,
             @RequestBody(required = false) ResolveRequest body) {
-        String decision = body == null ? "COMPENSATE" : body.getDecision();
+        String decision = body == null || body.getDecision() == null ? "COMPENSATE" : body.getDecision();
+        if (!"COMPENSATE".equalsIgnoreCase(decision)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "status", "REJECTED",
+                    "message", "Discrepancy resolution uses COMPENSATE only."));
+        }
         try {
             BatchReconciliationWorkflow stub = workflowClient.newWorkflowStub(
                     BatchReconciliationWorkflow.class, childWorkflowId);
             if (body != null && body.getTxnId() != null && !body.getTxnId().isBlank()) {
-                stub.resolveDiscrepancy(body.getTxnId(), decision);
+                stub.resolveDiscrepancy(body.getTxnId(), "COMPENSATE");
             } else {
-                stub.resolveDiscrepancies(decision);
+                stub.resolveDiscrepancies("COMPENSATE");
             }
         } catch (WorkflowNotFoundException ex) {
             return ResponseEntity.status(HttpStatus.CONFLICT).body(closedWorkflow(childWorkflowId, decision));
         }
         Map<String, String> response = new LinkedHashMap<>();
         response.put("childWorkflowId", childWorkflowId);
-        response.put("decision", decision);
+        response.put("decision", "COMPENSATE");
         if (body != null && body.getTxnId() != null) {
             response.put("txnId", body.getTxnId());
         }
@@ -146,63 +212,76 @@ public class ReconciliationController {
         return ResponseEntity.ok(response);
     }
 
-    private static Map<String, String> closedWorkflow(String workflowId, String decision) {
-        Map<String, String> body = new LinkedHashMap<>();
-        body.put("workflowId", workflowId);
-        body.put("decision", decision);
-        body.put("status", "NOT_RUNNING");
-        body.put("message", "This workflow is not running (Failed, Completed, or Terminated). Temporal can only receive a signal while status is Running. Start a new parent and wait until the child shows Running / WAITING_FOR_SIGNAL.");
-        return body;
-    }
-
     @GetMapping("/{workflowId}/result")
-    public ReconciliationResult result(@PathVariable String workflowId) {
-        WorkflowStub untyped = workflowClient.newUntypedWorkflowStub(workflowId);
-        return untyped.getResult(ReconciliationResult.class);
+    public ResponseEntity<?> result(@PathVariable String workflowId) {
+        BillingReconciliationWorkflow stub = workflowClient.newWorkflowStub(
+                BillingReconciliationWorkflow.class, workflowId);
+        WorkflowProgress progress = stub.getProgress();
+        if (progress.getLastResult() == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                    "status", "NO_RESULT",
+                    "message", "Coordinator is running; no file has completed yet."));
+        }
+        return ResponseEntity.ok(progress.getLastResult());
     }
 
-    @GetMapping("/runs/{runId}")
-    public ResponseEntity<ReconciliationResult> run(@PathVariable String runId) {
-        ReconciliationResult result = jdbc.findRun(runId);
+    @GetMapping("/files/{fileId}/result")
+    public ResponseEntity<ReconciliationResult> fileResult(@PathVariable String fileId) {
+        ReconciliationResult result = files.readResult(fileId);
         if (result == null) {
             return ResponseEntity.notFound().build();
         }
         return ResponseEntity.ok(result);
     }
 
-    /** Demo: inspect a transaction's billing vs GL amount (to see the mismatch). */
-    @GetMapping("/txns/{txnId}")
-    public ResponseEntity<Map<String, Object>> viewTxn(@PathVariable String txnId) {
-        Map<String, Object> view = jdbc.transactionView(txnId);
-        if (view == null) {
-            return ResponseEntity.notFound().build();
+    private String startCoordinator() {
+        String workflowId = properties.getCoordinator().getWorkflowId();
+        CoordinatorState state = new CoordinatorState();
+        state.setRequest(properties.toWorkflowRequest());
+        BillingReconciliationWorkflow stub = workflowClient.newWorkflowStub(
+                BillingReconciliationWorkflow.class, coordinatorOptions(workflowId, state.getRequest()));
+        try {
+            WorkflowClient.start(stub::run, state);
+        } catch (Exception ex) {
+            if (!alreadyStarted(ex)) {
+                throw ex;
+            }
         }
-        return ResponseEntity.ok(view);
+        return workflowId;
     }
 
-    /**
-     * Demo: correct a transaction in the DB, then signal the batch child with CONTINUE to re-process.
-     * Body is optional: {"amount": 123.45} sets an explicit value; omitted aligns billing to the GL.
-     */
-    @PostMapping("/txns/{txnId}/correct")
-    public ResponseEntity<Map<String, Object>> correctTxn(
-            @PathVariable String txnId,
-            @RequestBody(required = false) Map<String, Object> body) {
-        Map<String, Object> before = jdbc.transactionView(txnId);
-        if (before == null) {
-            return ResponseEntity.notFound().build();
+    private String signalWithStart(String signalName, FileNotification notification) {
+        String workflowId = properties.getCoordinator().getWorkflowId();
+        CoordinatorState state = new CoordinatorState();
+        state.setRequest(properties.toWorkflowRequest());
+        BillingReconciliationWorkflow stub = workflowClient.newWorkflowStub(
+                BillingReconciliationWorkflow.class, coordinatorOptions(workflowId, state.getRequest()));
+        WorkflowStub.fromTyped(stub).signalWithStart(signalName, new Object[]{notification}, new Object[]{state});
+        return workflowId;
+    }
+
+    private WorkflowOptions coordinatorOptions(String workflowId, com.billing.reconciliation.model.ReconciliationRequest request) {
+        WorkflowOptions.Builder options = WorkflowOptions.newBuilder()
+                .setWorkflowId(workflowId)
+                .setTaskQueue(properties.getTaskQueue())
+                .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE);
+        if (request.getWorkflowExecutionTimeoutSeconds() > 0) {
+            options.setWorkflowExecutionTimeout(Duration.ofSeconds(request.getWorkflowExecutionTimeoutSeconds()));
         }
-        Double amount = null;
-        if (body != null && body.get("amount") != null) {
-            amount = Double.parseDouble(body.get("amount").toString());
-        }
-        int updated = jdbc.correctTransactionAmount(txnId, amount);
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("txnId", txnId);
-        response.put("rowsUpdated", updated);
-        response.put("before", before);
-        response.put("after", jdbc.transactionView(txnId));
-        response.put("next", "POST /api/reconciliation/batches/{childWorkflowId}/resolve with {\"decision\":\"CONTINUE\"}");
-        return ResponseEntity.ok(response);
+        return options.build();
+    }
+
+    private static boolean alreadyStarted(Exception ex) {
+        String message = ex.getMessage() == null ? "" : ex.getMessage();
+        return message.contains("already started") || message.contains("AlreadyStarted");
+    }
+
+    private static Map<String, String> closedWorkflow(String workflowId, String decision) {
+        Map<String, String> body = new LinkedHashMap<>();
+        body.put("workflowId", workflowId);
+        body.put("decision", decision);
+        body.put("status", "NOT_RUNNING");
+        body.put("message", "This workflow is not running. Start the coordinator, then signal while status is Running.");
+        return body;
     }
 }

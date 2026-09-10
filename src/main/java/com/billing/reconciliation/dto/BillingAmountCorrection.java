@@ -8,7 +8,7 @@ import lombok.Setter;
 import java.math.BigDecimal;
 
 /**
- * Align a billing source amount to the GL (demo compensation policy).
+ * Align a billing CSV amount to the matching GL amount (COMPENSATE).
  */
 @Getter
 @Setter

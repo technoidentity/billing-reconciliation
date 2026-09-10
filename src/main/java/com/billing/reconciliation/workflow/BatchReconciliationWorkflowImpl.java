@@ -26,7 +26,6 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
 
     private String currentStep = "PENDING";
     private boolean resolved;
-    private String decision = "";
     private String signaledTxnId = "";
     private DiscrepancySummary problems = new DiscrepancySummary();
 
@@ -49,10 +48,8 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
         int round = resume == null ? 1 : resume.getRound();
         boolean everCompensated = resume != null && resume.isCompensated();
 
-        // Full pipeline runs every round. On a Continue-As-New the corrected data is re-read here, so a
-        // resumed run carries no stale per-row state — it re-derives discrepancies from the database.
-        log.info("Batch {} reconciliation round {} (ids {}-{})",
-                batch.getBatchNo(), round, batch.getFromId(), batch.getToId());
+        log.info("Batch {} file {} reconciliation round {} (ids {}-{})",
+                batch.getBatchNo(), batch.getFileId(), round, batch.getFromId(), batch.getToId());
         currentStep = "VALIDATE_SCHEMA";
         StepResult validated = ingestion.validateSchema(runId, batch);
         currentStep = "HANDLE_VALIDATION_ERRORS";
@@ -90,7 +87,6 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
             return buildResult(batch, validCount, invalidCount, processedCount, everCompensated, firstSeen);
         }
 
-        // Discrepancies remain: surface the problem ids and wait for a resolution signal.
         currentStep = "WAITING_FOR_SIGNAL";
         List<String> flagged = new ArrayList<>(problems.getTxnIds());
         showDiscrepancyIdsInUi(batch.getBatchNo(), flagged);
@@ -110,14 +106,12 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
         signaledTxnId = "";
 
         boolean compensatedThisRound = false;
-        if ("COMPENSATE".equalsIgnoreCase(decision) && !targeted.isEmpty()) {
+        if (!targeted.isEmpty()) {
             currentStep = "COMPENSATE";
-            compensation.compensateDiscrepancies(runId, targeted);
+            compensation.compensateDiscrepancies(runId, batch, targeted);
             compensatedThisRound = true;
         }
 
-        // Terminate this run and Continue-As-New so a fresh execution re-reads the corrected data and
-        // re-runs the identical pipeline. It should not carry the old discrepancies.
         currentStep = "CONTINUE_AS_NEW";
         BatchResume next = new BatchResume();
         next.setRound(round + 1);
@@ -146,11 +140,10 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
         if (ids.isEmpty()) {
             details.append("No remaining discrepancy ids.\n");
         } else {
-            details.append("Correct the data in the database, then resolve with:\n\n");
+            details.append("Discrepancy resolution uses **COMPENSATE only** (align billing amounts to the GL file).\n\n");
             details.append("`POST /api/reconciliation/batches/{this-workflow-id}/resolve`\n\n");
             details.append("```json\n{\"txnId\":\"<id below>\",\"decision\":\"COMPENSATE\"}\n```\n\n");
-            details.append("`COMPENSATE` auto-aligns billing to the GL; `CONTINUE` re-checks data you fixed. ")
-                    .append("Omit `txnId` to apply to every id below.\n\n");
+            details.append("Omit `txnId` to compensate every id below.\n\n");
             for (String id : ids) {
                 details.append("- `").append(id).append("`\n");
             }
@@ -196,15 +189,19 @@ public class BatchReconciliationWorkflowImpl implements BatchReconciliationWorkf
 
     @Override
     public void resolveDiscrepancies(String decision) {
+        if (!"COMPENSATE".equalsIgnoreCase(decision)) {
+            return;
+        }
         this.signaledTxnId = "";
-        this.decision = decision == null ? "" : decision;
         this.resolved = true;
     }
 
     @Override
     public void resolveDiscrepancy(String txnId, String decision) {
+        if (!"COMPENSATE".equalsIgnoreCase(decision)) {
+            return;
+        }
         this.signaledTxnId = txnId == null ? "" : txnId;
-        this.decision = decision == null ? "" : decision;
         this.resolved = true;
     }
 }

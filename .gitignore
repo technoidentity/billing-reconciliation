@@ -11,3 +11,9 @@ target/
 
 # Local docs / demo evidence (screenshots, run reports)
 /docs/
+
+# SFTP mount: keep empty home/destination, ignore dropped files and processing output
+/sftp/home/*
+!/sftp/home/.gitkeep
+/sftp/destination/*
+!/sftp/destination/.gitkeep

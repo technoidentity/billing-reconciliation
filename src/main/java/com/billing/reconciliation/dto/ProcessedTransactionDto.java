@@ -9,7 +9,7 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 
 /**
- * One {@code processed_transactions} row for Java enrichment and billing-rule calculation.
+ * One processed billing row used for enrichment, billing-rule calculation, and GL matching.
  */
 @Getter
 @Setter

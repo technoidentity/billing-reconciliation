@@ -3,19 +3,23 @@ package com.billing.reconciliation.workflow;
 import com.billing.reconciliation.activity.BillingRuleActivities;
 import com.billing.reconciliation.activity.CompensationActivities;
 import com.billing.reconciliation.activity.EnrichmentActivities;
+import com.billing.reconciliation.activity.FileActivities;
 import com.billing.reconciliation.activity.IngestionActivities;
 import com.billing.reconciliation.activity.ReconciliationActivities;
 import com.billing.reconciliation.activity.ReportingActivities;
 import com.billing.reconciliation.model.ActivityPolicyConfig;
 import com.billing.reconciliation.model.BatchRef;
+import com.billing.reconciliation.model.CoordinatorState;
 import com.billing.reconciliation.model.DiscrepancySummary;
+import com.billing.reconciliation.model.FileNotification;
+import com.billing.reconciliation.model.FileValidationResult;
 import com.billing.reconciliation.model.ReconciliationRequest;
-import com.billing.reconciliation.model.ReconciliationResult;
 import com.billing.reconciliation.model.RetryPolicyConfig;
 import com.billing.reconciliation.model.StepResult;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.client.WorkflowStub;
+import io.temporal.failure.ApplicationFailure;
 import io.temporal.testing.TestWorkflowEnvironment;
 import io.temporal.testing.TestWorkflowExtension;
 import io.temporal.worker.Worker;
@@ -24,19 +28,23 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
@@ -50,40 +58,60 @@ class BillingReconciliationWorkflowTest {
             .build();
 
     @Test
-    void completesHappyPathWithoutSignal(TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
-        fixtures(worker, env, new LinkedHashSet<>());
+    void processesSignaledFileWithoutDiscrepancies(
+            TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
+        fixtures(worker, env, new LinkedHashSet<>(), FileValidationResult.ok(
+                "billing-demo", "billing-demo.csv", "gl-demo.csv", "abc"));
 
-        BillingReconciliationWorkflow workflow = client.newWorkflowStub(
-                BillingReconciliationWorkflow.class,
-                WorkflowOptions.newBuilder().setTaskQueue(worker.getTaskQueue()).build());
+        BillingReconciliationWorkflow workflow = startCoordinator(client, worker);
+        workflow.fileAvailable(new FileNotification("billing-demo.csv"));
+        env.sleep(Duration.ofSeconds(2));
 
-        ReconciliationRequest request = sampleRequest();
-        request.setTaskQueue(worker.getTaskQueue());
-        ReconciliationResult result = workflow.run(request);
+        assertEquals("COMPLETED", workflow.getProgress().getLastResult().getStatus());
+        assertEquals(100, workflow.getProgress().getLastResult().getValidTxns());
+        assertFalse(workflow.getProgress().getLastResult().isCompensated());
 
-        assertEquals("COMPLETED", result.getStatus());
-        assertEquals(100, result.getValidTxns());
-        assertEquals(0, result.getDiscrepancyCount());
-        assertFalse(result.isCompensated());
+        workflow.shutdown();
+        WorkflowStub.fromTyped(workflow).getResult(Void.class);
     }
 
     @Test
-    void waitsForSignalThenCompensatesAndReprocesses(TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
-        Set<String> remaining = new LinkedHashSet<>(List.of("TXN-ERR-1", "TXN-ERR-2"));
-        CompensationActivities compensation = fixtures(worker, env, remaining);
+    void waitsForCorrectedFileThenRetriesValidation(
+            TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
+        FileValidationResult failed = FileValidationResult.failed(
+                "billing-demo", "billing-demo.csv", "HASH_MISMATCH");
+        FileValidationResult ok = FileValidationResult.ok(
+                "billing-demo", "billing-demo.csv", "gl-demo.csv", "abc");
+        fixtures(worker, env, new LinkedHashSet<>(), failed, ok);
 
-        BillingReconciliationWorkflow workflow = client.newWorkflowStub(
-                BillingReconciliationWorkflow.class,
-                WorkflowOptions.newBuilder()
-                        .setWorkflowId("parent-recon")
-                        .setTaskQueue(worker.getTaskQueue())
-                        .build());
-
-        ReconciliationRequest request = sampleRequest();
-        request.setTaskQueue(worker.getTaskQueue());
-        WorkflowClient.start(workflow::run, request);
-
+        BillingReconciliationWorkflow workflow = startCoordinator(client, worker);
+        workflow.fileAvailable(new FileNotification("billing-demo.csv"));
         env.sleep(Duration.ofSeconds(1));
+
+        assertEquals("WAITING_FOR_CORRECTION", workflow.getProgress().getCurrentStep());
+        assertTrue(workflow.getProgress().getWaitingForCorrection().contains("billing-demo.csv"));
+
+        workflow.retryCorrectedFile(new FileNotification("billing-demo.csv"));
+        env.sleep(Duration.ofSeconds(2));
+
+        assertEquals("COMPLETED", workflow.getProgress().getLastResult().getStatus());
+        assertEquals(1, workflow.getProgress().getCompletedFileCount());
+
+        workflow.shutdown();
+        WorkflowStub.fromTyped(workflow).getResult(Void.class);
+    }
+
+    @Test
+    void waitsForCompensateThenReprocesses(
+            TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
+        Set<String> remaining = new LinkedHashSet<>(List.of("TXN-ERR-1", "TXN-ERR-2"));
+        CompensationActivities compensation = fixtures(
+                worker, env, remaining,
+                FileValidationResult.ok("billing-demo", "billing-demo.csv", "gl-demo.csv", "abc"));
+
+        BillingReconciliationWorkflow workflow = startCoordinator(client, worker, "parent-recon");
+        workflow.fileAvailable(new FileNotification("billing-demo.csv"));
+        env.sleep(Duration.ofSeconds(2));
 
         String childId = workflow.getProgress().getChildWorkflowIds().get(0);
         BatchReconciliationWorkflow child = client.newWorkflowStub(BatchReconciliationWorkflow.class, childId);
@@ -93,83 +121,84 @@ class BillingReconciliationWorkflowTest {
         assertTrue(workflow.getProgress().isWaitingForSignal());
 
         workflow.resolveDiscrepancies("COMPENSATE");
-        ReconciliationResult result = WorkflowStub.fromTyped(workflow).getResult(ReconciliationResult.class);
+        env.sleep(Duration.ofSeconds(2));
 
-        assertEquals("COMPLETED_WITH_COMPENSATION", result.getStatus());
-        assertTrue(result.isCompensated());
-        assertEquals(2, result.getDiscrepancyCount());
-        verify(compensation).compensateDiscrepancies(anyString(), anyList());
+        assertEquals("COMPLETED_WITH_COMPENSATION", workflow.getProgress().getLastResult().getStatus());
+        assertTrue(workflow.getProgress().getLastResult().isCompensated());
+        verify(compensation).compensateDiscrepancies(anyString(), any(), anyList());
+
+        workflow.shutdown();
+        WorkflowStub.fromTyped(workflow).getResult(Void.class);
     }
 
     @Test
-    void continueSignalReprocessesCorrectedDataWithoutCompensation(
+    void ignoreContinueAndOnlyCompensate(
             TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
         Set<String> remaining = new LinkedHashSet<>(List.of("TXN-ERR-9"));
-        CompensationActivities compensation = fixtures(worker, env, remaining);
+        CompensationActivities compensation = fixtures(
+                worker, env, remaining,
+                FileValidationResult.ok("billing-demo", "billing-demo.csv", "gl-demo.csv", "abc"));
 
-        BillingReconciliationWorkflow workflow = client.newWorkflowStub(
-                BillingReconciliationWorkflow.class,
-                WorkflowOptions.newBuilder()
-                        .setWorkflowId("parent-continue")
-                        .setTaskQueue(worker.getTaskQueue())
-                        .build());
+        BillingReconciliationWorkflow workflow = startCoordinator(client, worker, "parent-continue");
+        workflow.fileAvailable(new FileNotification("billing-demo.csv"));
+        env.sleep(Duration.ofSeconds(2));
 
-        ReconciliationRequest request = sampleRequest();
-        request.setTaskQueue(worker.getTaskQueue());
-        WorkflowClient.start(workflow::run, request);
-        env.sleep(Duration.ofSeconds(1));
-
-        // Operator corrects the data in the DB (modelled by clearing the mismatch), then signals CONTINUE.
-        remaining.clear();
         workflow.resolveDiscrepancies("CONTINUE");
-        ReconciliationResult result = WorkflowStub.fromTyped(workflow).getResult(ReconciliationResult.class);
+        env.sleep(Duration.ofSeconds(1));
+        verify(compensation, never()).compensateDiscrepancies(anyString(), any(), anyList());
+        assertEquals("WAITING_FOR_SIGNAL",
+                client.newWorkflowStub(BatchReconciliationWorkflow.class,
+                        workflow.getProgress().getChildWorkflowIds().get(0)).getCurrentStep());
 
-        assertEquals("COMPLETED", result.getStatus());
-        assertFalse(result.isCompensated());
-        verify(compensation, never()).compensateDiscrepancies(anyString(), anyList());
+        workflow.resolveDiscrepancies("COMPENSATE");
+        env.sleep(Duration.ofSeconds(2));
+        assertTrue(workflow.getProgress().getLastResult().isCompensated());
+
+        workflow.shutdown();
+        WorkflowStub.fromTyped(workflow).getResult(Void.class);
     }
 
     @Test
     void resolveOneTxnIdAtATimeReprocessesUntilClean(
             TestWorkflowEnvironment env, Worker worker, WorkflowClient client) {
         Set<String> remaining = new LinkedHashSet<>(List.of("TXN-ERR-1", "TXN-ERR-2"));
-        CompensationActivities compensation = fixtures(worker, env, remaining);
+        CompensationActivities compensation = fixtures(
+                worker, env, remaining,
+                FileValidationResult.ok("billing-demo", "billing-demo.csv", "gl-demo.csv", "abc"));
 
-        BillingReconciliationWorkflow workflow = client.newWorkflowStub(
-                BillingReconciliationWorkflow.class,
-                WorkflowOptions.newBuilder()
-                        .setWorkflowId("parent-per-id")
-                        .setTaskQueue(worker.getTaskQueue())
-                        .build());
-
-        ReconciliationRequest request = sampleRequest();
-        request.setTaskQueue(worker.getTaskQueue());
-        WorkflowClient.start(workflow::run, request);
-        env.sleep(Duration.ofSeconds(1));
+        BillingReconciliationWorkflow workflow = startCoordinator(client, worker, "parent-per-id");
+        workflow.fileAvailable(new FileNotification("billing-demo.csv"));
+        env.sleep(Duration.ofSeconds(2));
 
         String childId = workflow.getProgress().getChildWorkflowIds().get(0);
         BatchReconciliationWorkflow child = client.newWorkflowStub(BatchReconciliationWorkflow.class, childId);
 
         child.resolveDiscrepancy("TXN-ERR-1", "COMPENSATE");
-        env.sleep(Duration.ofSeconds(1));
+        env.sleep(Duration.ofSeconds(2));
 
         assertEquals(List.of("TXN-ERR-2"), child.getProblems().getTxnIds());
         assertEquals("WAITING_FOR_SIGNAL", child.getCurrentStep());
 
         child.resolveDiscrepancy("TXN-ERR-2", "COMPENSATE");
-        ReconciliationResult result = WorkflowStub.fromTyped(workflow).getResult(ReconciliationResult.class);
+        env.sleep(Duration.ofSeconds(2));
 
-        assertTrue(result.isCompensated());
-        verify(compensation).compensateDiscrepancies(anyString(), org.mockito.ArgumentMatchers.eq(List.of("TXN-ERR-1")));
-        verify(compensation).compensateDiscrepancies(anyString(), org.mockito.ArgumentMatchers.eq(List.of("TXN-ERR-2")));
+        assertTrue(workflow.getProgress().getLastResult().isCompensated());
+        verify(compensation, times(1)).compensateDiscrepancies(
+                anyString(), any(), org.mockito.ArgumentMatchers.eq(List.of("TXN-ERR-1")));
+        verify(compensation, times(1)).compensateDiscrepancies(
+                anyString(), any(), org.mockito.ArgumentMatchers.eq(List.of("TXN-ERR-2")));
+
+        workflow.shutdown();
+        WorkflowStub.fromTyped(workflow).getResult(Void.class);
     }
 
-    /**
-     * Wires mock activities. {@code remaining} models the still-mismatched txn ids in the database:
-     * {@code identifyDiscrepancies} reports a snapshot of it each round, and {@code compensateDiscrepancies}
-     * corrects (removes) the targeted ids — so a Continue-As-New re-run sees the corrected data.
-     */
-    private CompensationActivities fixtures(Worker worker, TestWorkflowEnvironment env, Set<String> remaining) {
+    private CompensationActivities fixtures(
+            Worker worker,
+            TestWorkflowEnvironment env,
+            Set<String> remaining,
+            FileValidationResult validation,
+            FileValidationResult... laterValidations) {
+        FileActivities fileActivities = mock(FileActivities.class, withSettings().withoutAnnotations());
         IngestionActivities ingestion = mock(IngestionActivities.class, withSettings().withoutAnnotations());
         EnrichmentActivities enrichment = mock(EnrichmentActivities.class, withSettings().withoutAnnotations());
         BillingRuleActivities billingRules = mock(BillingRuleActivities.class, withSettings().withoutAnnotations());
@@ -177,8 +206,25 @@ class BillingReconciliationWorkflowTest {
         CompensationActivities compensation = mock(CompensationActivities.class, withSettings().withoutAnnotations());
         ReportingActivities reporting = mock(ReportingActivities.class, withSettings().withoutAnnotations());
 
-        BatchRef batch = new BatchRef(1, 1, 100);
-        when(ingestion.listBatches(100_000)).thenReturn(List.of(batch));
+        BatchRef batch = new BatchRef(1, 1, 100, "billing-demo");
+        List<FileValidationResult> sequence = new ArrayList<>();
+        sequence.add(validation);
+        if (laterValidations != null) {
+            sequence.addAll(Arrays.asList(laterValidations));
+        }
+        AtomicInteger call = new AtomicInteger(0);
+        when(fileActivities.locateAndValidate(any())).thenAnswer(inv -> {
+            int i = Math.min(call.getAndIncrement(), sequence.size() - 1);
+            FileValidationResult v = sequence.get(i);
+            if (!v.isValid()) {
+                // A failed validation is modelled as the activity throwing (red in the UI); the parent
+                // catches it and parks the file for a corrected re-send.
+                throw ApplicationFailure.newNonRetryableFailure(
+                        v.getMessage() == null ? "VALIDATION_FAILED" : v.getMessage(), "HashMismatch");
+            }
+            return v;
+        });
+        when(fileActivities.sliceBatches(anyString(), anyInt())).thenReturn(List.of(batch));
         when(ingestion.validateSchema(anyString(), any())).thenReturn(new StepResult("VALIDATE_SCHEMA", 100, "ok"));
         when(ingestion.handleValidationErrors(anyString(), any())).thenReturn(new StepResult("HANDLE_VALIDATION_ERRORS", 0, "ok"));
         when(enrichment.fetchVendorData(anyString(), any())).thenReturn(new StepResult("FETCH_VENDOR_DATA", 10, "ok"));
@@ -195,19 +241,40 @@ class BillingReconciliationWorkflowTest {
                     List<String> ids = new ArrayList<>(remaining);
                     return new DiscrepancySummary(ids.size(), ids.size() * 10.0, ids);
                 });
-        when(compensation.compensateDiscrepancies(anyString(), anyList()))
+        when(compensation.compensateDiscrepancies(anyString(), any(), anyList()))
                 .thenAnswer(inv -> {
-                    List<String> ids = inv.getArgument(1);
+                    List<String> ids = inv.getArgument(2);
                     remaining.removeAll(ids);
                     return new StepResult("COMPENSATE", ids.size(), "ok");
                 });
-        when(reporting.generateReports(anyString())).thenReturn(new StepResult("GENERATE_REPORTS", 1, "ok"));
-        when(reporting.notifyStakeholders(anyString(), any())).thenReturn(new StepResult("NOTIFY_STAKEHOLDERS", 2, "ok"));
-        when(reporting.logAuditTrail(anyString(), anyString(), anyString())).thenReturn(new StepResult("AUDIT", 1, "ok"));
+        when(reporting.generateReports(anyString(), anyString())).thenReturn(new StepResult("GENERATE_REPORTS", 1, "ok"));
+        when(reporting.notifyStakeholders(anyString(), anyString(), any())).thenReturn(new StepResult("NOTIFY_STAKEHOLDERS", 2, "ok"));
+        when(reporting.logAuditTrail(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new StepResult("AUDIT", 1, "ok"));
 
-        worker.registerActivitiesImplementations(ingestion, enrichment, billingRules, reconciliation, compensation, reporting);
+        worker.registerActivitiesImplementations(
+                fileActivities, ingestion, enrichment, billingRules, reconciliation, compensation, reporting);
         env.start();
         return compensation;
+    }
+
+    private BillingReconciliationWorkflow startCoordinator(WorkflowClient client, Worker worker) {
+        return startCoordinator(client, worker, "billing-reconciliation-coordinator");
+    }
+
+    private BillingReconciliationWorkflow startCoordinator(WorkflowClient client, Worker worker, String workflowId) {
+        BillingReconciliationWorkflow workflow = client.newWorkflowStub(
+                BillingReconciliationWorkflow.class,
+                WorkflowOptions.newBuilder()
+                        .setWorkflowId(workflowId)
+                        .setTaskQueue(worker.getTaskQueue())
+                        .build());
+        CoordinatorState state = new CoordinatorState();
+        ReconciliationRequest request = sampleRequest();
+        request.setTaskQueue(worker.getTaskQueue());
+        state.setRequest(request);
+        WorkflowClient.start(workflow::run, state);
+        return workflow;
     }
 
     private static ReconciliationRequest sampleRequest() {
@@ -229,7 +296,11 @@ class BillingReconciliationWorkflowTest {
         request.setTeamsChannel("billing-ops-teams");
         request.setWorkflowExecutionTimeoutSeconds(0);
         request.setChildExecutionTimeoutSeconds(0);
+        request.setContinueAsNewHistoryBytes(50L * 1024 * 1024);
+        request.setMaxFileValidationAttempts(3);
+        request.setFileValidationRetryIntervalSeconds(1);
         request.setIngestion(policy());
+        request.setFileValidation(policy());
         request.setEnrichment(policy());
         request.setBillingRules(policy());
         request.setReconciliation(policy());

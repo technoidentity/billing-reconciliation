@@ -12,10 +12,16 @@ import java.util.List;
 @ConfigurationProperties(prefix = "billing")
 public class BillingProperties {
 
+    /** Temporal workflow history practical maximum; Continue-As-New threshold is capped at this. */
+    public static final long CONTINUE_AS_NEW_HISTORY_BYTES_CAP = 50L * 1024 * 1024;
+
     private String taskQueue = TaskQueues.BILLING;
     private int batchSize = 100_000;
     private int maxParallelBatches = 12;
-    private Schedule schedule = new Schedule();
+    private Coordinator coordinator = new Coordinator();
+    private Files files = new Files();
+    private Sftp sftp = new Sftp();
+    private FileValidation fileValidation = new FileValidation();
     private ApiEndpoint vendorApi = new ApiEndpoint();
     private ApiEndpoint customerApi = new ApiEndpoint();
     private Discrepancy discrepancy = new Discrepancy();
@@ -43,7 +49,21 @@ public class BillingProperties {
         request.setTeamsChannel(notifications.getTeamsChannel());
         request.setWorkflowExecutionTimeoutSeconds(workflow.getExecutionTimeout().toSeconds());
         request.setChildExecutionTimeoutSeconds(workflow.getChildExecutionTimeout().toSeconds());
+        // 0 = rely on Temporal's isContinueAsNewSuggested(); >0 also forces CAN at that byte threshold (capped 50MB).
+        long historyBytes = workflow.getContinueAsNewHistoryBytes();
+        request.setContinueAsNewHistoryBytes(historyBytes <= 0 ? 0
+                : Math.min(historyBytes, CONTINUE_AS_NEW_HISTORY_BYTES_CAP));
+        request.setMaxFileValidationAttempts(Math.max(1, fileValidation.getMaxRetryAttempts()));
+        request.setFileValidationRetryIntervalSeconds(Math.max(1, fileValidation.getRetryInterval().toSeconds()));
         request.setIngestion(toPolicy(activities.getIngestion()));
+        // The file-validation ACTIVITY retry policy is the locate/hash retry loop shown in the UI.
+        // One knob drives it: billing.file-validation.max-retry-attempts / retry-interval.
+        // "Not found yet" failures retry; "present but wrong" failures do not.
+        ActivityPolicyConfig fileValidationPolicy = toPolicy(activities.getFileValidation());
+        fileValidationPolicy.getRetry().setMaximumAttempts(Math.max(1, fileValidation.getMaxRetryAttempts()));
+        fileValidationPolicy.getRetry().setInitialIntervalSeconds(Math.max(1, fileValidation.getRetryInterval().toSeconds()));
+        fileValidationPolicy.getRetry().setDoNotRetry(new ArrayList<>(List.of("HashMismatch", "GlHashMismatch")));
+        request.setFileValidation(fileValidationPolicy);
         request.setEnrichment(toPolicy(activities.getEnrichment()));
         request.setBillingRules(toPolicy(activities.getBillingRules()));
         request.setReconciliation(toPolicy(activities.getReconciliation()));
@@ -93,12 +113,36 @@ public class BillingProperties {
         this.maxParallelBatches = maxParallelBatches;
     }
 
-    public Schedule getSchedule() {
-        return schedule;
+    public Coordinator getCoordinator() {
+        return coordinator;
     }
 
-    public void setSchedule(Schedule schedule) {
-        this.schedule = schedule;
+    public void setCoordinator(Coordinator coordinator) {
+        this.coordinator = coordinator;
+    }
+
+    public Files getFiles() {
+        return files;
+    }
+
+    public void setFiles(Files files) {
+        this.files = files;
+    }
+
+    public Sftp getSftp() {
+        return sftp;
+    }
+
+    public void setSftp(Sftp sftp) {
+        this.sftp = sftp;
+    }
+
+    public FileValidation getFileValidation() {
+        return fileValidation;
+    }
+
+    public void setFileValidation(FileValidation fileValidation) {
+        this.fileValidation = fileValidation;
     }
 
     public ApiEndpoint getVendorApi() {
@@ -157,71 +201,163 @@ public class BillingProperties {
         this.activities = activities;
     }
 
-    public static class Schedule {
-        private boolean enabled = true;
-        private String id = "daily-billing-reconciliation";
-        private String cron = "0 8 * * *";
-        private String timezone = "America/Chicago";
-        private String workflowIdPrefix = "billing-reconciliation";
-        // If the previous daily run is still in progress at the next trigger:
-        // BUFFER_ONE queues one run; SKIP drops it; ALLOW_ALL runs concurrently.
-        private String overlapPolicy = "BUFFER_ONE";
+    public static class Coordinator {
+        private String workflowId = "billing-reconciliation-coordinator";
+        private boolean autoStart = true;
 
-        public boolean isEnabled() {
-            return enabled;
+        public String getWorkflowId() {
+            return workflowId;
         }
 
-        public String getOverlapPolicy() {
-            return overlapPolicy;
+        public void setWorkflowId(String workflowId) {
+            this.workflowId = workflowId;
         }
 
-        public void setOverlapPolicy(String overlapPolicy) {
-            this.overlapPolicy = overlapPolicy;
+        public boolean isAutoStart() {
+            return autoStart;
         }
 
-        public void setEnabled(boolean enabled) {
-            this.enabled = enabled;
+        public void setAutoStart(boolean autoStart) {
+            this.autoStart = autoStart;
+        }
+    }
+
+    public static class Files {
+        private String mode = "sftp";
+        /** Codebase SFTP mount root. Contains home/ (drop) and destination/ (copied files + work). */
+        private String root = "./sftp";
+        /**
+         * true (default) = API starts the copy in the background and signals at the same time → the
+         * workflow's locate activity retries until a large file finishes landing (durability). false =
+         * copy home→destination fully, then signal → the workflow's locate finds the file immediately.
+         */
+        private boolean asyncCopy = true;
+        /** Demo only: delay (seconds) before the async copy starts, to force visible locate retries. */
+        private long copyDelaySeconds = 0;
+
+        public String getMode() {
+            return mode;
         }
 
-        public String getId() {
-            return id;
+        public void setMode(String mode) {
+            this.mode = mode;
         }
 
-        public void setId(String id) {
-            this.id = id;
+        public String getRoot() {
+            return root;
         }
 
-        public String getCron() {
-            return cron;
+        public void setRoot(String root) {
+            this.root = root;
         }
 
-        public void setCron(String cron) {
-            this.cron = cron;
+        public boolean isAsyncCopy() {
+            return asyncCopy;
         }
 
-        public String getTimezone() {
-            return timezone;
+        public void setAsyncCopy(boolean asyncCopy) {
+            this.asyncCopy = asyncCopy;
         }
 
-        public void setTimezone(String timezone) {
-            this.timezone = timezone;
+        public long getCopyDelaySeconds() {
+            return copyDelaySeconds;
         }
 
-        public String getWorkflowIdPrefix() {
-            return workflowIdPrefix;
+        public void setCopyDelaySeconds(long copyDelaySeconds) {
+            this.copyDelaySeconds = copyDelaySeconds;
         }
 
-        public void setWorkflowIdPrefix(String workflowIdPrefix) {
-            this.workflowIdPrefix = workflowIdPrefix;
+        public java.nio.file.Path destinationPath() {
+            return java.nio.file.Path.of(root).toAbsolutePath().normalize().resolve("destination");
+        }
+
+        public boolean isLocal() {
+            return "local".equalsIgnoreCase(mode);
+        }
+    }
+
+    public static class Sftp {
+        private String host = "localhost";
+        private int port = 2222;
+        private String username = "billing";
+        private String password = "billing";
+        private String homeDir = "home";
+        private String destinationDir = "destination";
+
+        public String getHost() {
+            return host;
+        }
+
+        public void setHost(String host) {
+            this.host = host;
+        }
+
+        public int getPort() {
+            return port;
+        }
+
+        public void setPort(int port) {
+            this.port = port;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getPassword() {
+            return password;
+        }
+
+        public void setPassword(String password) {
+            this.password = password;
+        }
+
+        public String getHomeDir() {
+            return homeDir;
+        }
+
+        public void setHomeDir(String homeDir) {
+            this.homeDir = homeDir;
+        }
+
+        public String getDestinationDir() {
+            return destinationDir;
+        }
+
+        public void setDestinationDir(String destinationDir) {
+            this.destinationDir = destinationDir;
+        }
+    }
+
+    public static class FileValidation {
+        private int maxRetryAttempts = 3;
+        private Duration retryInterval = Duration.ofSeconds(5);
+
+        public int getMaxRetryAttempts() {
+            return maxRetryAttempts;
+        }
+
+        public void setMaxRetryAttempts(int maxRetryAttempts) {
+            this.maxRetryAttempts = maxRetryAttempts;
+        }
+
+        public Duration getRetryInterval() {
+            return retryInterval;
+        }
+
+        public void setRetryInterval(Duration retryInterval) {
+            this.retryInterval = retryInterval;
         }
     }
 
     public static class ApiEndpoint {
         private String baseUrl = "http://localhost:8080";
         private Duration timeout = Duration.ofSeconds(30);
-        // Enrichment calls the API in parallel, bounded to this many concurrent requests per batch.
         private int maxConcurrentCalls = 1000;
-        // Ids per request; the id list is split into chunks and the chunks are called concurrently.
         private int bulkChunkSize = 200;
 
         public String getBaseUrl() {
@@ -259,8 +395,6 @@ public class BillingProperties {
 
     public static class Discrepancy {
         private double amountTolerance = 0.01;
-        // Loop guard: max correct-signal-reprocess rounds a batch child will run before it
-        // completes and reports still-unresolved ids (prevents an unbounded human-in-the-loop cycle).
         private int maxResolutionRounds = 10;
 
         public double getAmountTolerance() {
@@ -377,11 +511,9 @@ public class BillingProperties {
     }
 
     public static class WorkflowTimeouts {
-        // 0 = unbounded. A daily reconciliation is long-running and each 100K child may wait an
-        // arbitrarily long time for a human discrepancy signal, so execution timeouts are off by
-        // default and rely on per-activity start-to-close + heartbeat timeouts instead.
         private Duration executionTimeout = Duration.ZERO;
         private Duration childExecutionTimeout = Duration.ZERO;
+        private long continueAsNewHistoryBytes = 20L * 1024 * 1024;
 
         public Duration getExecutionTimeout() {
             return executionTimeout;
@@ -398,10 +530,19 @@ public class BillingProperties {
         public void setChildExecutionTimeout(Duration childExecutionTimeout) {
             this.childExecutionTimeout = childExecutionTimeout;
         }
+
+        public long getContinueAsNewHistoryBytes() {
+            return continueAsNewHistoryBytes;
+        }
+
+        public void setContinueAsNewHistoryBytes(long continueAsNewHistoryBytes) {
+            this.continueAsNewHistoryBytes = continueAsNewHistoryBytes;
+        }
     }
 
     public static class Activities {
         private ActivityTimeouts ingestion = new ActivityTimeouts();
+        private ActivityTimeouts fileValidation = new ActivityTimeouts();
         private ActivityTimeouts enrichment = new ActivityTimeouts();
         private ActivityTimeouts billingRules = new ActivityTimeouts();
         private ActivityTimeouts reconciliation = new ActivityTimeouts();
@@ -414,6 +555,14 @@ public class BillingProperties {
 
         public void setIngestion(ActivityTimeouts ingestion) {
             this.ingestion = ingestion;
+        }
+
+        public ActivityTimeouts getFileValidation() {
+            return fileValidation;
+        }
+
+        public void setFileValidation(ActivityTimeouts fileValidation) {
+            this.fileValidation = fileValidation;
         }
 
         public ActivityTimeouts getEnrichment() {

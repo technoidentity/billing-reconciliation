@@ -1,222 +1,137 @@
 # Billing Reconciliation Demo Guide
 
-This guide covers running the Temporal billing-reconciliation demo with `scripts/demo.ps1`.
+Runs the file-based billing reconciliation demo with `scripts/demo.sh` (Linux/macOS) or
+`scripts/demo.ps1` (Windows PowerShell 5.1). Input is **CSV files on SFTP** — there is no database.
+A long-running coordinator workflow waits for file signals, validates by SHA-256, fans out child
+workflows per batch, and resolves discrepancies with **COMPENSATE**.
 
 ## Prerequisites
 
-- Windows PowerShell 5.1 or later
-- Docker Desktop with Docker Compose
-- Java and Maven, if the application JAR must be built
-- A running Temporal server, normally at `127.0.0.1:7233`
+- Docker Desktop with Docker Compose (for the SFTP container and Temporal)
+- Java 17 and Maven (only if the application JAR must be built)
+- A reachable Temporal server (local `127.0.0.1:7233`, or Temporal Cloud via `TEMPORAL_*`)
+- Python 3 (the sample-file generator)
 
-`demo.ps1` does not start Temporal. It checks that the configured Temporal TCP endpoint is reachable, starts billing PostgreSQL, and starts the Spring Boot application/Temporal worker.
-
-## PowerShell version
-
-`demo.ps1` is a native Windows PowerShell script and has been validated with Windows PowerShell 5.1. Check the version if needed:
-
-```powershell
-$PSVersionTable.PSVersion
-```
-
-Run the script directly from Windows PowerShell:
-
-```powershell
-.\scripts\demo.ps1
-```
+The scripts do not start Temporal. They start the SFTP container and the Spring Boot app (REST API +
+Temporal worker), then drive the coordinator over its signals.
 
 ## Configuration
 
-Set environment variables before running a command:
-
-```powershell
-$env:ROWS = "24000"
-$env:BATCH_SIZE = "2000"
-$env:MAX_PARALLEL = "12"
-$env:APP_PORT = "8081"
-```
+Set environment variables before a command:
 
 | Variable | Default | Effect |
 |---|---:|---|
-| `APP_PORT` | `8080` | Application REST/health port. |
-| `ROWS` | `1200000` | Dummy transactions loaded by `data`. |
-| `BATCH_SIZE` | `100000` | Transactions per child workflow. |
-| `MAX_PARALLEL` | `12` | Maximum parallel batch setting passed to the app. |
-| `TEMPORAL_TARGET` | `127.0.0.1:7233` | Temporal host and port checked by `up`. |
-| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
-| `TEMPORAL_API_KEY` | empty | Optional Temporal Cloud API key. |
-| `TEMPORAL_ENABLE_HTTPS` | `false` | Enables HTTPS/TLS configuration. |
-| `TEMPORAL_IDENTITY` | empty | Optional Temporal client identity. |
-| `TEMPORAL_UI` | `http://localhost:8088` | Base URL used for the printed Temporal UI link. |
-
-The child count is `ceil(ROWS / BATCH_SIZE)`. For example, 24,000 rows with a batch size of 2,000 creates 12 child workflows.
+| `APP_PORT` | `8080` | Application REST/health port |
+| `ROWS` | `1200000` | Rows in the generated sample CSV |
+| `BATCH_SIZE` | `100000` | Transactions per child workflow (child count = `ceil(ROWS / BATCH_SIZE)`) |
+| `MAX_PARALLEL` | `12` | Max child workflows processed at once |
+| `TEMPORAL_TARGET` | `127.0.0.1:7233` | Temporal endpoint |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace |
+| `TEMPORAL_API_KEY` | empty | Temporal Cloud API key (TLS auto-enables) |
+| `TEMPORAL_UI` | `http://localhost:8088` | Base URL for the printed UI link |
+| `BILLING_FILES_ASYNC_COPY` | `true` | Background copy + concurrent signal → `locate` retries until the file lands |
+| `BILLING_FILES_COPY_DELAY` | `0` | Seconds to delay the async copy (forces visible `locate` retries in a demo) |
 
 ## Recommended demo
 
-```powershell
-$env:ROWS = "24000"
-$env:BATCH_SIZE = "2000"
+Linux/macOS:
 
+```bash
+ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh up
+ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh data
+./scripts/demo.sh process billing-demo.csv
+./scripts/demo.sh status
+./scripts/demo.sh resolve all
+./scripts/demo.sh stop
+```
+
+Windows PowerShell 5.1:
+
+```powershell
+$env:ROWS = "24000"; $env:BATCH_SIZE = "2000"
 .\scripts\demo.ps1 up
 .\scripts\demo.ps1 data
-.\scripts\demo.ps1 run
+.\scripts\demo.ps1 process billing-demo.csv
 .\scripts\demo.ps1 status
-.\scripts\demo.ps1 resolve
+.\scripts\demo.ps1 resolve all
 .\scripts\demo.ps1 stop
 ```
 
-For a one-shot start/load/run:
+One-shot: `./scripts/demo.sh quickstart 5000` (or `.\scripts\demo.ps1 quickstart 5000`).
 
-```powershell
-.\scripts\demo.ps1 all
-```
+## What a run does
 
-## Commands
+1. **`data`** generates `billing-demo.csv`, its `gl-demo.csv` companion, and `.sha256` sidecars in
+   `sftp/home` (plus `vendors.csv` / `customers.csv` reference files). It seeds one GL mismatch
+   (`TXN0000000001`) and invalid rows every 5,000th txn.
+2. **`process`** copies the file `home → destination` and signals the coordinator (**Signal 1**). By
+   default the copy is asynchronous and the signal is sent at the same time.
+3. The coordinator runs the `locateAndValidate` activity: it computes the file SHA-256 and compares it to
+   the producer sidecar. The **run identity is the checksum**, not the filename.
+4. It slices the file into batches and starts one child workflow per batch. Each child validates, enriches,
+   applies billing rules, and matches against the GL file.
+5. A batch with a mismatch pauses at `WAITING_FOR_SIGNAL`. **`resolve`** sends COMPENSATE, which aligns the
+   billing amount to the GL and Continue-As-News to re-check.
+6. When a file completes, reports are written under `sftp/destination/outbound/{sha256}/`. The coordinator
+   returns to listening for the next file and never terminates.
 
-### `up`
+## Failure and durability demos
 
-Checks for Docker, tests the Temporal TCP endpoint, starts the `postgresql` Compose service, waits for `billing-postgres` to become ready, builds the JAR if missing, and starts the Java application in the background.
+- **Validation failure (red activity, coordinator survives):**
 
-The app health check is `GET http://localhost:<APP_PORT>/actuator/health`, polled for up to 60 seconds. Logs are written to `%TEMP%\billing-demo\app.log` and `%TEMP%\billing-demo\app.err.log`; the process ID is stored in `%TEMP%\billing-demo\app.pid`.
+  ```bash
+  ./scripts/demo.sh fail typo-name.csv
+  ```
 
-### `data`
+  Signals a missing/mistyped filename. `locateAndValidate` fails **red** in the Temporal UI and retries
+  ("not found yet" is retryable); the coordinator catches the failure, parks the file in
+  `WAITING_FOR_CORRECTION`, and keeps processing other files. Drop the corrected file and run
+  `./scripts/demo.sh retry <name>` (**Signal 2**).
 
-Checks PostgreSQL readiness and runs `scripts\insert-dummy-data.ps1 -Rows <ROWS>`. The seed data includes invalid transactions and GL mismatches for the discrepancy-resolution demo. This command does not start a workflow.
+- **Durability (locate retries until a large file lands):**
 
-### `run`
+  ```bash
+  ./scripts/demo.sh large 800000
+  ```
 
-Checks application health and sends `POST /api/reconciliation/start`. It saves the returned parent workflow ID to `%TEMP%\billing-demo\wf`, prints a Temporal UI link, waits ten seconds, and scans child status.
+  Generates a large file and processes it async, so `locateAndValidate` retries until the copy finishes.
+  Set `BILLING_FILES_COPY_DELAY` to force retries for small files too.
 
-The parent workflow starts one `BatchReconciliationWorkflow` per batch. Each child runs:
+## Command reference
 
-1. Schema validation and validation-error handling.
-2. Vendor and customer enrichment.
-3. Record merging.
-4. Billing rules, adjustments/discounts, and penalties/late fees.
-5. GL query and in-memory transaction matching.
-6. Discrepancy identification.
-7. Completion, or waiting for a resolution signal.
-
-After all children finish, the parent generates reports, records notifications, logs audit data, and completes the run.
-
-### `status`
-
-Displays application health, PostgreSQL container state, configured Temporal target/namespace, parent workflow progress, and every child’s current step. It uses the saved workflow ID from `%TEMP%\billing-demo\wf`.
-
-### `restart`
-
-Stops and restarts only the Java application. PostgreSQL and Temporal remain running. Temporal workflow history is retained, so parked children can resume waiting for signals after the worker restarts.
-
-### `stop`
-
-Stops the Java app and the `postgresql` Compose service. It does not delete volumes or the Temporal schedule. The daily Temporal schedule remains registered.
-
-### `down`
-
-Requires an exact lowercase `y` confirmation, then runs `stop` and `docker compose down -v`. This removes Docker volumes and demo PostgreSQL data. Use it only to reset the environment.
-
-### `all`
-
-Runs `up`, then `data`, then `run`. If `up` fails, the remaining commands are not useful and should be run separately for diagnosis.
-
-### No command / `menu`
-
-Opens an interactive menu with these mappings:
-
-| Menu option | Command |
+| Command | Action |
 |---|---|
-| `1` | `up` |
-| `2` | `data` |
-| `3` | `run` |
-| `4` | `status` |
-| `5` | `resolve` |
-| `6` | `restart` |
-| `7` | `stop` |
-| `8` | `all` |
-| `q` | Quit |
+| `up` | Start the SFTP container + app + coordinator |
+| `start` | Start the long-running coordinator (idempotent) |
+| `data [rows]` | Generate billing + GL CSV + checksums into `sftp/home` |
+| `files` | List billing CSVs in `sftp/home` |
+| `process [file]` | Copy `home → destination`, then Signal 1 |
+| `retry [file]` | Copy again, then Signal 2 (corrected file) |
+| `resolve [all\|batch\|txn]` | COMPENSATE all waiting children, one batch, or one txn id |
+| `status` | Containers + coordinator progress |
+| `clear` | Delete all files in `sftp/home` and `sftp/destination` |
+| `fail [name]` | Signal a missing/typed filename (validate fails red, coordinator continues) |
+| `large [rows]` | Generate a large file and process async (locate retries → durability) |
+| `restart` | Restart the local app (worker + API) |
+| `stop` | Stop the local app + SFTP |
+| `quickstart [rows]` | `up` + generate a sample + process `billing-demo.csv` |
 
-## `resolve` and child options
+## SFTP and ports
 
-`resolve` requires the app to be healthy and a saved parent workflow ID. It scans all expected child IDs (`<parent-id>-batch-<number>`) and lists children in `WAITING_FOR_SIGNAL`.
+| Port | Service |
+|---|---|
+| 8080 | Application REST API + worker |
+| 8088 | Temporal UI |
+| 7233 | Temporal gRPC |
+| 2222 | SFTP (`billing` / `billing`; `home` and `destination` dirs, bind-mounted from `./sftp`) |
 
-## Signal routing: parent versus child workflow
+## Manual curl
 
-Discrepancy decisions are ultimately consumed by the `BatchReconciliationWorkflow` child that is paused in `WAITING_FOR_SIGNAL`.
-
-| Demo action | Workflow signaled | Endpoint | Effect |
-|---|---|---|---|
-| Resolve one batch | The selected `BatchReconciliationWorkflow` child | `POST /api/reconciliation/batches/{childWorkflowId}/resolve` | Sends the decision only to that child. |
-| Resolve one transaction ID | The selected `BatchReconciliationWorkflow` child | Same child endpoint, with `txnId` | Sends a targeted decision to that child and transaction. |
-| Correct a transaction + Continue | The selected `BatchReconciliationWorkflow` child | Correction endpoint, then same child resolve endpoint | Updates the demo transaction first, then signals the child to re-read the database. |
-| Parent fan-out | The `BillingReconciliationWorkflow` parent | `POST /api/reconciliation/{parentWorkflowId}/resolve` | The parent signals every currently pending child; completed children are skipped. |
-
-The parent does not perform the batch compensation itself. In the fan-out case, it forwards the decision to each waiting child. Each child then decides whether to invoke its compensation activity, Continue-As-New, and rerun its own batch pipeline.
-
-The `COMPENSATE` or `CONTINUE` decision is therefore handled as follows:
-
-1. The API receives the request.
-2. The API signals either the selected child or the parent.
-3. If the parent was signaled, it forwards the signal to pending child workflows.
-4. The child wakes from `Workflow.await(...)`.
-5. `COMPENSATE` invokes the compensation activity for the selected IDs; `CONTINUE` skips compensation.
-6. The child uses Continue-As-New and re-runs validation, enrichment, billing calculation, GL matching, and discrepancy identification.
-
-### 1. COMPENSATE a whole batch
-
-Selects a waiting batch and sends `COMPENSATE` to that child. The compensation policy computes corrections in Java memory, but the result is persisted to PostgreSQL. For each flagged ID with a GL amount, it updates the billing transaction amount to the GL amount, resets processed adjustment/discount/penalty/final-amount fields, and marks the discrepancy compensated. The child then uses Continue-As-New to re-read the corrected database state and rerun the pipeline.
-
-### 2. CONTINUE a whole batch
-
-Selects a waiting batch and sends `CONTINUE`. No compensation writes occur. The child Continue-As-News and rechecks current database state; records corrected outside the workflow can clear the mismatch while unchanged records remain flagged.
-
-### 3. Resolve a single ID
-
-Selects a waiting batch, lists its discrepancy transaction IDs, asks for one ID, and asks for `COMPENSATE` or `CONTINUE`. The decision is targeted to that transaction ID. A targeted `COMPENSATE` persists the billing correction for only that ID, resets its processed money, and marks its discrepancy compensated.
-
-### 4. Correct a transaction in DB + CONTINUE
-
-Selects one discrepancy, calls `GET /api/reconciliation/txns/{txnId}`, calls the demo correction endpoint `POST /api/reconciliation/txns/{txnId}/correct`, then sends targeted `CONTINUE`. This demonstrates external data correction followed by workflow re-evaluation.
-
-### 5. Parent fan-out to all waiting
-
-Asks for `COMPENSATE` or `CONTINUE`, then sends the decision to `POST /api/reconciliation/{parentId}/resolve`. The parent fans the signal out to all currently pending children. Completed children are not signaled.
-
-### 6. Refresh
-
-Refreshes child steps and parent progress without sending a resolution.
-
-### `b` Back
-
-Leaves the resolution loop.
-
-## Workflow observation
-
-The printed Temporal UI URL opens the parent workflow. The REST endpoints used by the script are:
-
-```text
-GET  /api/reconciliation/{workflowId}/progress
-GET  /api/reconciliation/batches/{childWorkflowId}/step
-GET  /api/reconciliation/batches/{childWorkflowId}/problems
-POST /api/reconciliation/batches/{childWorkflowId}/resolve
-POST /api/reconciliation/{workflowId}/resolve
+```bash
+APP=http://localhost:8080/api/reconciliation
+curl -X POST $APP/files/available -H 'Content-Type: application/json' -d '{"fileName":"billing-demo.csv"}'
+curl $APP/billing-reconciliation-coordinator/progress
+curl -X POST $APP/billing-reconciliation-coordinator/resolve -H 'Content-Type: application/json' -d '{"decision":"COMPENSATE"}'
+# after fixing a rejected file in sftp/home:
+curl -X POST $APP/files/retry -H 'Content-Type: application/json' -d '{"fileName":"billing-demo.csv"}'
 ```
-
-Expected child states include `VALIDATE_SCHEMA`, `MATCH_TRANSACTIONS`, `WAITING_FOR_SIGNAL`, `CONTINUE_AS_NEW`, and `COMPLETED`.
-
-## Troubleshooting
-
-- Temporal unreachable: start Temporal or set `$env:TEMPORAL_TARGET` correctly.
-- App not running: inspect `%TEMP%\billing-demo\app.log` and `app.err.log`.
-- `Postgres not up`: run `up` before `data`.
-- `no run - run 'run' first`: the app health check passed, but `%TEMP%\billing-demo\wf` is missing or empty; run `run` first.
-- No waiting children: the workflow may still be processing, or all batches may have completed without discrepancies.
-
-## Reset
-
-To remove the demo database and start over:
-
-```powershell
-.\scripts\demo.ps1 down
-```
-
-Confirm with lowercase `y`, then run `all` again.

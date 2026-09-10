@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.function.IntConsumer;
 
 /**
- * Compares processed original amounts to GL amounts in memory. No JDBC — callers persist the result.
+ * Compares processed original amounts to GL amounts in memory. Callers write mismatches to CSV.
  */
 @Component
 public class GlMatcher {

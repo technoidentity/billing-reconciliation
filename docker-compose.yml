@@ -1,22 +1,20 @@
 services:
-  postgresql:
-    container_name: billing-postgres
-    image: postgres:16
+  sftp:
+    container_name: billing-sftp
+    image: atmoz/sftp:alpine
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
-    shm_size: 1gb
+      - "2222:22"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./docker/sftp/users.conf:/etc/sftp/users.conf:ro
+      # Codebase SFTP mount: drop files in sftp/home, processed copies in sftp/destination.
+      - ./sftp/home:/home/billing/home
+      - ./sftp/destination:/home/billing/destination
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pgrep sshd >/dev/null"]
       interval: 5s
-      timeout: 5s
-      retries: 20
+      timeout: 3s
+      retries: 12
     networks:
       - billing-net
 
@@ -78,17 +76,12 @@ services:
     build: .
     restart: unless-stopped
     depends_on:
-      postgresql:
+      sftp:
         condition: service_healthy
       temporal:
         condition: service_started
     environment:
       SERVER_PORT: 8080
-      DB_HOST: postgresql
-      DB_PORT: 5432
-      DB_NAME: billing
-      DB_USER: billing
-      DB_PASSWORD: billing
       TEMPORAL_TARGET: ${TEMPORAL_TARGET:-temporal:7233}
       TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       TEMPORAL_ENABLE_HTTPS: ${TEMPORAL_ENABLE_HTTPS:-false}
@@ -97,13 +90,22 @@ services:
       TEMPORAL_IDENTITY: ${TEMPORAL_IDENTITY:-}
       VENDOR_API_URL: http://localhost:8080
       CUSTOMER_API_URL: http://localhost:8080
+      BILLING_FILES_MODE: sftp
+      BILLING_SFTP_ROOT: /sftp
+      SFTP_HOST: sftp
+      SFTP_PORT: 22
+      SFTP_USER: billing
+      SFTP_PASSWORD: billing
+      SFTP_HOME_DIR: home
+      SFTP_DESTINATION_DIR: destination
+    volumes:
+      - ./sftp:/sftp
     ports:
       - "8080:8080"
     networks:
       - billing-net
 
 volumes:
-  postgres_data:
   temporal-postgres-data:
 
 networks:

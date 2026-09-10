@@ -11,9 +11,9 @@ import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 
 /**
- * Reconciles one 100K-transaction batch: validate → enrich → apply billing rules → match to the GL →
- * identify discrepancies. On a discrepancy it surfaces the problem txn ids and waits for a resolution
- * signal, then Continue-As-News into a fresh run that re-processes the corrected data.
+ * Reconciles one file batch: validate → enrich → apply billing rules → match to the GL file →
+ * identify discrepancies. On a discrepancy it waits for COMPENSATE, writes compensated amounts
+ * back to the batch CSV, then Continue-As-News so the pipeline re-reads file data.
  */
 @WorkflowInterface
 public interface BatchReconciliationWorkflow {

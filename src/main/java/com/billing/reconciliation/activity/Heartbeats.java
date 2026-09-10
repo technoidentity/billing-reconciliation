@@ -11,7 +11,11 @@ final class Heartbeats {
     }
 
     static void beat(String detail) {
-        ActivityExecutionContext ctx = Activity.getExecutionContext();
-        ctx.heartbeat(detail);
+        try {
+            ActivityExecutionContext ctx = Activity.getExecutionContext();
+            ctx.heartbeat(detail);
+        } catch (Exception ignored) {
+            // No activity context in unit tests.
+        }
     }
 }

@@ -10,8 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Demo saga policy: the ledger is the system of record, so flagged billing amounts are aligned
- * to the GL and processed money fields are reset. No JDBC — callers persist the result.
+ * Aligns flagged billing amounts to the GL (system of record) and resets processed money fields.
+ * Callers write the result back to the batch CSV.
  */
 @Component
 public class CompensationPolicy {

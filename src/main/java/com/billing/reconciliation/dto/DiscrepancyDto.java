@@ -8,7 +8,7 @@ import lombok.Setter;
 import java.math.BigDecimal;
 
 /**
- * One billing-vs-GL mismatch to persist in {@code discrepancies}.
+ * One billing-vs-GL mismatch written to {@code discrepancies/batch-n.csv}.
  */
 @Getter
 @Setter

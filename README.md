@@ -1,86 +1,58 @@
 # Billing Reconciliation
 
-Daily billing reconciliation orchestrated by **Temporal**. Transactions are validated, enriched, and priced in **Java activities**, matched to the general ledger, and held for operator resolution when amounts disagree.
+Billing reconciliation orchestrated by **Temporal**. Transactions arrive as **CSV files** on SFTP, are validated, enriched, and priced in **Java activities**, matched to a companion general-ledger file, and held for **COMPENSATE** when amounts disagree.
 
-The demonstration scale is **1.2 million** rows, processed as **12 parallel child workflows** of 100,000 transactions. One Spring Boot process hosts the REST API and the worker. PostgreSQL stores source data and run artifacts.
+There is no daily schedule and no billing database. A long-running parent workflow waits for file signals. Files are the source of input and of intermediate results. One Spring Boot process hosts the REST API and the worker.
+
+The designed demonstration scale is **1.2 million** rows as **12 parallel child workflows** of 100,000 transactions. Local Compose defaults use `batch-size` **10000** (override with `BILLING_BATCH_SIZE`).
 
 | Component | Detail |
 | --- | --- |
 | Language / runtime | Java 17, Spring Boot 3.3.5 |
 | Orchestration | Temporal Java SDK 1.30.1 (local server or Temporal Cloud) |
-| Database | PostgreSQL 16 (`billing`) |
-| Scale (default) | 1.2M rows · 100K per child · 12 concurrent children |
+| Input | CSV + SHA-256 sidecar on SFTP (or a local directory in tests) |
 | Task queue | `billing-reconciliation-queue` |
-
-## Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Processing model](#processing-model)
-- [Workflow design](#workflow-design)
-- [Prerequisites](#prerequisites)
-- [Getting started](#getting-started)
-- [Running a reconciliation](#running-a-reconciliation)
-- [Discrepancy resolution](#discrepancy-resolution)
-- [Schedule](#schedule)
-- [Configuration](#configuration)
-- [Scenario mapping](#scenario-mapping)
-- [Sample data](#sample-data)
-- [HTTP API](#http-api)
-- [Demo script](#demo-script)
-- [Tests](#tests)
-- [Source layout](#source-layout)
-
----
-
-## Overview
-
-Each run:
-
-1. Slices `billing_transactions` into batches.
-2. Validates schema in Java and records per-field failures.
-3. Enriches valid rows with vendor and customer data (HTTP, with a local-table fallback).
-4. Applies surcharge, discount, and late-fee rules in Java.
-5. Matches processed original amounts to general-ledger entries.
-6. Waits for `COMPENSATE` or `CONTINUE` when mismatches remain, then Continue-As-New and re-runs the pipeline.
-7. After every child completes, persists compliance reports, notification records, and an audit trail.
-
-**Workflows** orchestrate steps and stay deterministic. **Activities** execute I/O and business rules. **PostgreSQL** loads DTOs and persists results; it does not classify rows, compute fees, or decide mismatches.
-
-A step-by-step mapping to the 16-step scenario is in [`IMPLEMENTATION_COVERAGE.md`](IMPLEMENTATION_COVERAGE.md).
-
----
+| Coordinator workflow id | `billing-reconciliation-coordinator` |
 
 ## Architecture
 
+SFTP login (Docker `atmoz/sftp`) is defined in [`docker/sftp/users.conf`](docker/sftp/users.conf): user `billing`, password `billing`, directories `home` and `destination`, port **2222**.
+
 ```
-                    Temporal Schedule                         REST API
-                    08:00 America/Chicago                     POST /api/reconciliation/start
-                    daily-billing-reconciliation              POST .../resolve
-                              |                                         |
-                              |  schedule start                         |  WorkflowClient
-                              v                                         v
-            +------------------------------- Temporal --------------------------------+
-            |  UI :8088  ──────────────►  Server :7233                                 |
-            |                                |                    |                    |
-            |                           Task queue                +── Temporal Postgres |
-            |                    billing-reconciliation-queue                          |
-            +--------------------------------^-----------------------------------------+
-                                             | poll / complete
-            +--------------------------------+-----------------------------------------+
-            |                         Spring Boot :8080                                |
-            |     REST API     |     Temporal worker     |     Mock enrichment HTTP    |
-            |                  |                         |     /api/vendors/bulk       |
-            |                  |                         |     /api/customers/bulk     |
-            +--------+---------+------------+------------+--------------+--------------+
-                     |                      |                           |
-                     |  start / signal      |  load / persist           |  loopback HTTP
-                     |                      v                           v
-                     |              +------ Billing PostgreSQL :5432 ------------------+
-                     +------------► |  billing_transactions   gl_entries               |
-                                    |  processed_transactions discrepancies            |
-                                    |  reports  notifications  audit_log               |
-                                    +--------------------------------------------------+
+sftp/                          # Docker SFTP mount in this repo
+  home/                        # drop (bind-mounted to /home/billing/home)
+    billing-demo.csv
+    billing-demo.csv.sha256
+    gl-demo.csv
+    gl-demo.csv.sha256
+  destination/                 # API copy + work (bind-mounted to /home/billing/destination)
+    billing-demo.csv            # copy of the selected drop file
+    work/{sha256}/             # slices and processing copies (identity = billing SHA-256)
+    outbound/{sha256}/         # reports
+    reference/                 # vendors.csv, customers.csv
+```
+
+Checksum files use GNU `sha256sum` format (`<hex>  filename`). Integrity is validated against the **producer's `.sha256` sidecar** (an independent reference), or an `expectedSha256` on the signal — never a hash the API recomputes from the same bytes. The GL companion is `gl-` + the billing stem when `glFileName` is omitted.
+
+```
+     POST /files/available          POST /files/retry
+     API copies home → destination (sync) OR starts the copy in the background
+     and signals at the same time (async → locate retries for large files)
+                 \                     /
+                  v                   v
+            BillingReconciliationWorkflow   (long-running parent, no schedule)
+                  |
+                  |  activity: locateAndValidate (SHA-256 vs sidecar); run identity = checksum
+                  |     THROWS on failure → activity is RED in the UI:
+                  |       "not found yet" retries (per file-validation policy) — durability
+                  |       "present but wrong" fails fast (non-retryable)
+                  |     parent CATCHES the failure → WAITING_FOR_CORRECTION (stays up, next files continue)
+                  |     ok → promote to destination/work/{sha256}/ → slice → children
+                  v
+            BatchReconciliationWorkflow × N
+                  |
+                  v
+            sftp/destination/work/{sha256}/  and  outbound/{sha256}/ reports
 ```
 
 | Port | Service |
@@ -88,64 +60,34 @@ A step-by-step mapping to the 16-step scenario is in [`IMPLEMENTATION_COVERAGE.m
 | 8080 | Application REST API and worker |
 | 8088 | Temporal UI |
 | 7233 | Temporal gRPC |
-| 5432 | Billing PostgreSQL |
+| 2222 | SFTP (`billing` / `billing`, directories `home` and `destination`) |
 
----
-
-## Processing model
-
-Temporal activities load rows as DTOs, apply Java engines, then persist. Heartbeats are emitted about every 5,000 rows so long batches stay within activity heartbeat timeouts.
-
-| Concern | Java | PostgreSQL |
-| --- | --- | --- |
-| Schema validation | `SchemaValidator` | Status `VALID` / `INVALID` and `validation_errors` |
-| Vendor / customer fetch | Parallel bulk HTTP | Cache write; local `vendors` / `customers` fallback |
-| Enrichment | `RecordEnricher` | Upsert `processed_transactions` |
-| Surcharge, discount, late fee | `BillingRulesEngine` | Updated money columns |
-| GL match | `GlMatcher` | Insert `discrepancies` |
-| Compensation | `CompensationPolicy` | Billing amount aligned to GL |
-
-Lookups, batch slicing, counts, reports, and audit inserts remain SQL. They do not evaluate billing rules.
-
-GL match (`GlMatcher`) flags `MISSING_GL` or `AMOUNT_MISMATCH` when the absolute difference exceeds tolerance `0.01`. Match uses **original** processed amount, not the fee-adjusted final amount.
-
----
+Temporal uses its own Postgres for workflow history. Billing data stays in CSV files.
 
 ## Workflow design
 
 ### Parent: `BillingReconciliationWorkflow`
 
-One parent execution per run. Child workflow ids are `{parentId}-batch-{n}`. Reporting and notification run only after every child returns.
+Starts **once** (`billing-reconciliation-coordinator`) and stays running. No Temporal Schedule.
 
-```
-  Schedule 08:00  or  POST /start
-              │
-              ▼
-  BillingReconciliationWorkflow
-              │
-              │  startRun, listBatches
-              │
-              ├── spawn children (max-parallel-batches = 12)
-              │     BatchReconciliationWorkflow
-              │     {parentId}-batch-1  …  {parentId}-batch-12
-              │
-              │     POST /batches/{childId}/resolve  ──► child signal
-              │     POST /{parentId}/resolve         ──► fan-out to waiting children
-              │
-              │  wait for all children
-              ▼
-  generateReports → notifyStakeholders → completeRun
-```
+1. **Signal 1 — `fileAvailable`:** the API moves the named file from **sftp/home** to **sftp/destination** and notifies the parent. In **async** mode (default: `billing.files.async-copy=true`) the copy runs in the background and the signal is sent concurrently, so `locateAndValidate` retries until the file lands; set `"async": false` (or the config) for a synchronous copy that is present before the signal. The run id is the billing file **SHA-256**, not the filename.
+2. The `locateAndValidate` activity finds the file in destination and SHA-256-validates it against the producer sidecar. It **throws on failure** (red in the UI): "not found yet" is **retryable** (a large file still landing is retried, per `billing.file-validation.max-retry-attempts`, default 3), "present but wrong" (hash mismatch) is **non-retryable**.
+3. On success it promotes to `destination/work/{sha256}/`, slices, and starts child workflows.
+4. On failure the parent **catches the activity failure**, parks the file in **WAITING_FOR_CORRECTION**, and keeps processing other files (it never terminates).
+5. **Signal 2 — `retryCorrectedFile`:** the API copies the corrected drop again; the parent re-runs `locateAndValidate` (which retries internally).
+6. When a file’s children finish, the parent writes reports under `destination/outbound/{sha256}/` and waits for the next file.
+
+**Continue-As-New** is driven by Temporal's `isContinueAsNewSuggested()` (covers history size **and** event count). `billing.workflow.continue-as-new-history-bytes` is an optional byte override (**0 = off**, capped at **50MB**). CAN only fires when the parent is idle; pending files, waiting-for-correction state, and recent results are carried forward under the same workflow id.
 
 ### Child: `BatchReconciliationWorkflow`
 
-Every resolution round re-runs the full pipeline against current database state. `COMPENSATE` computes billing-to-GL corrections in Java memory, then persists them to PostgreSQL: it updates billing amounts, resets processed adjustment/discount/penalty/final-amount fields, and marks discrepancies compensated. The child then uses Continue-As-New to re-read those database changes and rerun the pipeline. `CONTINUE` skips compensation writes and re-reads the database. The loop stops after `max-resolution-rounds` (default 10).
+Children operate on file slices only. Discrepancy resolution is **COMPENSATE only** (align billing CSV amounts to the GL file).
 
 ```
   VALIDATE_SCHEMA
   HANDLE_VALIDATION_ERRORS
-  FETCH_VENDOR_DATA            →  HTTP /api/vendors/bulk     (fallback: vendors)
-  FETCH_CUSTOMER_DATA          →  HTTP /api/customers/bulk   (fallback: customers)
+  FETCH_VENDOR_DATA            →  HTTP /api/vendors/bulk     (fallback: reference/vendors.csv)
+  FETCH_CUSTOMER_DATA          →  HTTP /api/customers/bulk   (fallback: reference/customers.csv)
   ENRICH_RECORDS
   APPLY_BILLING_RULES
   CALCULATE_ADJUSTMENTS
@@ -159,210 +101,120 @@ Every resolution round re-runs the full pipeline against current database state.
             └── mismatches and round < 10
                       WAITING_FOR_SIGNAL
                             │
-                            │  COMPENSATE  →  CompensationPolicy, then Continue-As-New
-                            │  CONTINUE    →  Continue-As-New without auto-fix
+                            │  COMPENSATE  →  write GL amounts into the batch CSV, then Continue-As-New
                             ▼
                       round + 1, same workflow id, back to VALIDATE_SCHEMA
 ```
 
-Parent execution timeout is unbounded so a run can wait on human resolution. Each scheduled start creates a **new** parent execution.
-
----
-
-## Prerequisites
-
-| Requirement | Notes |
-| --- | --- |
-| Docker and Docker Compose | PostgreSQL, Temporal, and (optional) the application image |
-| JDK 17 | Local `mvn` builds and tests |
-| Maven 3.9+ | `mvn test`, `mvn spring-boot:run` |
-| Temporal CLI (optional) | Workflow inspection; not required to start a run via REST |
-
----
-
 ## Getting started
 
-Start PostgreSQL, Temporal, the UI, and the application. The API listens on **8080**; Temporal UI on **8088**.
+Linux / macOS:
 
 ```bash
+mkdir -p sftp/home sftp/destination
 docker compose up -d --build
-./scripts/insert-dummy-data.sh
-curl -X POST http://localhost:8080/api/reconciliation/start
+./scripts/demo.sh quickstart 5000
 ```
 
-Windows PowerShell:
+Windows PowerShell 5.1:
 
 ```powershell
+New-Item -ItemType Directory -Force -Path sftp\home, sftp\destination | Out-Null
 docker compose up -d --build
-.\scripts\insert-dummy-data.ps1
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/reconciliation/start
+.\scripts\demo.ps1 quickstart 5000
 ```
 
-Rebuild the application image (`docker compose up -d --build`) after Java engine changes so the worker is not still running the previous SQL-based rules.
+If ExecutionPolicy blocks `.ps1` files:
 
-If a Temporal server is already running elsewhere, use the [demo script](#demo-script). It starts only PostgreSQL and the application (default API port **8081**, so it does not collide with a Temporal UI on 8080):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\demo.ps1 quickstart 5000
+```
+
+The coordinator auto-starts when the app boots (`billing.coordinator.auto-start: true`). `POST /start` and demo `start` are idempotent if it is already running.
+
+SFTP credentials: user `billing`, password `billing`, port **2222**. Host `./sftp/home` and `./sftp/destination` are bind-mounted into the container. `POST /files/available` **copies** the named file from `home` to `destination` in the API, then signals the parent. Temporal identifies the run by the file **SHA-256**.
+
+Manual curl (after the stack is up and a CSV is in `sftp/home`):
 
 ```bash
-./scripts/demo.sh all
+curl -X POST http://localhost:8080/api/reconciliation/files/available \
+  -H 'Content-Type: application/json' \
+  -d '{"fileName":"billing-demo.csv"}'
 ```
 
-```powershell
-.\scripts\demo.ps1 all
+Local JVM talking to Docker SFTP:
+
+```bash
+docker compose up -d sftp temporal temporal-ui
+BILLING_FILES_MODE=sftp \
+SFTP_HOST=localhost \
+SFTP_PORT=2222 \
+SFTP_USER=billing \
+SFTP_PASSWORD=billing \
+SFTP_HOME_DIR=home \
+SFTP_DESTINATION_DIR=destination \
+BILLING_SFTP_ROOT=./sftp \
+mvn spring-boot:run
 ```
-
-Examples below use port 8080. Substitute 8081 when using `demo.sh`.
-
----
 
 ## Running a reconciliation
 
 ```bash
 APP=http://localhost:8080/api/reconciliation
+WF=billing-reconciliation-coordinator
 
 curl -X POST $APP/start
-# {"workflowId":"billing-reconciliation-2026-09-08-…","status":"STARTED","txnCount":1200000,"expectedBatches":12}
-WF=<workflowId from the response>
+curl -X POST $APP/files/available \
+  -H 'Content-Type: application/json' \
+  -d '{"fileName":"billing-demo.csv"}'
 
 curl $APP/$WF/progress
-curl $APP/batches/$WF-batch-1/step
-curl $APP/batches/$WF-batch-1/problems
+# Child ids are {coordinatorId}-{fileId}-{runShort}-batch-{n}
 
-curl -X POST $APP/batches/$WF-batch-1/resolve \
+curl -X POST $APP/$WF/resolve \
   -H 'Content-Type: application/json' \
   -d '{"decision":"COMPENSATE"}'
 
-curl $APP/$WF/result
+# After a failed hash check, replace the CSV + .sha256 in sftp/home, then:
+curl -X POST $APP/files/retry \
+  -H 'Content-Type: application/json' \
+  -d '{"fileName":"billing-demo.csv"}'
+
+curl $APP/files/{sha256}/result
 ```
-
-1. `POST /start` starts `BillingReconciliationWorkflow`. `listBatches` partitions by row count: `ceil(transactions / batch-size)`.
-2. The parent starts children up to `max-parallel-batches` (default 12).
-3. Each child validates, enriches, applies billing rules, matches the GL, and identifies discrepancies.
-4. Clean children complete. Children with mismatches enter `WAITING_FOR_SIGNAL` and expose transaction ids.
-5. A resolve signal uses **Continue-As-New**. The new round re-executes the pipeline; corrected ids drop off.
-6. When every child is done, the parent writes reports, notifications, and audit rows.
-
-Resolving one batch completes only that child. Reports and notifications run on the parent after all children finish.
-
----
 
 ## Discrepancy resolution
 
 | Request | Scope | Behavior |
 | --- | --- | --- |
-| `{"decision":"COMPENSATE"}` | Entire batch | Compute corrections in memory, persist flagged billing amounts aligned to GL in PostgreSQL, reset processed money, mark discrepancies compensated, then Continue-As-New. |
-| `{"decision":"CONTINUE"}` | Entire batch | Re-run against current data. Unfixed ids wait again. |
-| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Persist compensation for `X` only, reset its processed money, mark it compensated, then Continue-As-New. Other ids reappear on the next round. |
-| `{"txnId":"X","decision":"CONTINUE"}` | One id | Re-check that id. |
-| Same body on the parent `/resolve` | Fan-out | Deliver the decision to every child still waiting. |
+| `{"decision":"COMPENSATE"}` | Entire batch | Align every flagged billing amount to the GL file, then Continue-As-New. |
+| `{"txnId":"X","decision":"COMPENSATE"}` | One id | Compensate `X` only. |
+| Same body on the parent `/resolve` | Fan-out | COMPENSATE every child still waiting. |
 
-An empty body (`{}`) defaults to **COMPENSATE** for the whole batch. After a manual data correction, send `{"decision":"CONTINUE"}`.
-
-```bash
-curl $APP/txns/TXN0001050001
-curl -X POST $APP/txns/TXN0001050001/correct -d '{}'
-curl -X POST $APP/batches/$WF-batch-11/resolve \
-  -H 'Content-Type: application/json' \
-  -d '{"txnId":"TXN0001050001","decision":"CONTINUE"}'
-```
-
-Signaling a failed or completed workflow returns HTTP 409 `NOT_RUNNING`. After resolve, Temporal UI shows a **Continued as New** child run, then **Completed** when the batch is clean.
-
----
-
-## Schedule
-
-[`ReconciliationScheduleConfig`](src/main/java/com/billing/reconciliation/config/ReconciliationScheduleConfig.java) registers a Temporal Schedule at startup.
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `billing.schedule.enabled` | `true` | Register on boot (`BILLING_SCHEDULE_ENABLED`) |
-| `billing.schedule.cron` | `0 8 * * *` | 08:00 |
-| `billing.schedule.timezone` | `America/Chicago` | Schedule timezone |
-| `billing.schedule.overlap-policy` | `BUFFER_ONE` | If the previous run is still open at 08:00 |
-
-Overlap policies: `BUFFER_ONE`, `SKIP`, `ALLOW_ALL`, `CANCEL_OTHER`, `TERMINATE_OTHER`. Inspect the schedule in Temporal UI → **Schedules** → `daily-billing-reconciliation`.
-
----
+Invalid files are fixed by replacing the CSV on SFTP and sending Signal 2 (`POST /files/retry`).
 
 ## Configuration
 
-Settings live in [`application.yaml`](src/main/resources/application.yaml) and are bound by [`BillingProperties`](src/main/java/com/billing/reconciliation/config/BillingProperties.java). Values are copied into workflow input so timeouts and rule parameters stay deterministic on replay.
+Settings live in [`application.yaml`](src/main/resources/application.yaml) and are bound by [`BillingProperties`](src/main/java/com/billing/reconciliation/config/BillingProperties.java).
 
 | Area | Defaults |
 | --- | --- |
-| Batching | `batch-size` 100000, `max-parallel-batches` 12 |
-| Worker | 100 activity executors, 50 workflow-task executors |
-| Enrichment | 1000 concurrent calls, bulk chunk 200, 30s timeout, cache fallback |
-| Rules | Surcharge, discount, and late fee in [`application.yaml`](src/main/resources/application.yaml) |
+| Batching | `batch-size` 10000 (set `BILLING_BATCH_SIZE=100000` for the 1.2M-row scale), `max-parallel-batches` 12 |
+| Files | `sftp/home` (drop) → `sftp/destination` (copy + work); mode `sftp` or `local`; CSV + `.sha256` |
+| Copy mode | `async-copy` **true (default)** = background copy + concurrent signal → locate retries; false = copy then signal; `copy-delay-seconds` 0 (demo) |
+| File retry | `max-retry-attempts` 3, `retry-interval` 5s — drives the `locateAndValidate` activity retry (visible red attempts) |
+| Continue-As-New | `isContinueAsNewSuggested()` primary; `continue-as-new-history-bytes` **0 = off** (optional byte override, cap 50MB) |
 | Match | Amount tolerance `0.01`; max resolution rounds `10` |
-| Timeouts | Parent and child execution unbounded (`0s`); activities 15–30m with 2m heartbeat; retry 1s → 16s, coefficient 2 |
+| Timeouts | Parent and child execution unbounded (`0s`) |
 
 ### Temporal connection
 
 | Variable | Local | Temporal Cloud |
 | --- | --- | --- |
-| `TEMPORAL_TARGET` | `127.0.0.1:7233` | `<ns>.<accountId>.tmprl.cloud:7233` |
+| `TEMPORAL_TARGET` | `127.0.0.1:7233` (Compose app uses `temporal:7233`) | `<ns>.<accountId>.tmprl.cloud:7233` |
 | `TEMPORAL_NAMESPACE` | `default` | `<namespace>.<accountId>` |
-| `TEMPORAL_ENABLE_HTTPS` / `TEMPORAL_TLS` | `false` | `true` (also forced when `TEMPORAL_API_KEY` is set) |
+| `TEMPORAL_ENABLE_HTTPS` / `TEMPORAL_TLS` | `false` | `true` |
 | `TEMPORAL_API_KEY` | empty | Cloud API key |
-| `TEMPORAL_IDENTITY` | SDK `host@pid` | Optional worker label |
-| `TEMPORAL_TASK_QUEUE` | `billing-reconciliation-queue` | Isolate queues if required |
-
-Cloud is configuration-only ([`TemporalClientConfig`](src/main/java/com/billing/reconciliation/config/TemporalClientConfig.java)). Do not store the API key in YAML.
-
-```bash
-export TEMPORAL_TARGET=my-namespace.abc123.tmprl.cloud:7233
-export TEMPORAL_NAMESPACE=my-namespace.abc123
-export TEMPORAL_API_KEY='your-api-key'
-docker compose up -d --build
-```
-
----
-
-## Scenario mapping
-
-| Step | Implementation |
-| --- | --- |
-| 1. Scheduled trigger 08:00 | Temporal Schedule |
-| 2. Read 1.2M in 100K batches | `IngestionActivities.listBatches` → child workflows |
-| 3. Validate schema | `SchemaValidator` via `IngestionActivities.validateSchema` |
-| 4. Handle validation errors | `handleValidationErrors` with activity retry (1s–16s) |
-| 5–6. Vendor / customer | Parallel bulk HTTP, then local-table fallback |
-| 7. Enrich | `RecordEnricher`, idempotent upsert |
-| 8–10. Rules, discounts, late fees | `BillingRulesEngine` via `BillingRuleActivities` |
-| 11–12. Query GL, match | `GlMatcher`; persist `discrepancies` |
-| 13. Identify and resolve | Wait → `CompensationPolicy` or `CONTINUE` → Continue-As-New |
-| 14–16. Reports, notify, audit | `ReportingActivities` → `reports`, `notifications`, `audit_log` |
-
-Reports and notifications are stored in PostgreSQL. This demonstration does not send email, Teams webhooks, or SFTP files.
-
----
-
-## Sample data
-
-```bash
-./scripts/insert-dummy-data.sh            # 1,200,000 rows
-./scripts/insert-dummy-data.sh 24000      # smaller set
-```
-
-```powershell
-.\scripts\insert-dummy-data.ps1
-.\scripts\insert-dummy-data.ps1 24000
-```
-
-The script applies [`scripts/migrate-schema.sql`](scripts/migrate-schema.sql), then inserts. Seeded anomalies:
-
-- General-ledger mismatches on `id % 10000 = 1` (GL amount + 417) — one discrepancy per 100K batch.
-- Invalid rows with `amount = 0` on every 5,000th transaction.
-
-Database **`billing`** on `localhost:5432`, user `billing` / `billing`.
-
-| Kind | Tables |
-| --- | --- |
-| Source | `billing_transactions`, `vendors`, `customers`, `gl_entries` |
-| Run | `processed_transactions`, `discrepancies`, `reports`, `notifications`, `audit_log`, `validation_errors`, `reconciliation_runs`, `vendor_cache`, `customer_cache` |
-
----
 
 ## HTTP API
 
@@ -370,49 +222,83 @@ Base path: `/api/reconciliation`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/start` | Start a run (rejected if the table is empty) |
-| GET | `/{workflowId}/progress` | Parent progress and child ids |
-| GET | `/{workflowId}/result` | Final result (waits until complete) |
-| POST | `/{workflowId}/resolve` | Fan a decision to waiting children |
+| POST | `/start` | Start the long-running coordinator if it is not running |
+| POST | `/files/available` | Copy `sftp/home` → `sftp/destination` (API), then Signal 1. Run id = sha256 |
+| POST | `/files/retry` | Copy again, then Signal 2 — retry a corrected file |
+| GET | `/{workflowId}/progress` | Coordinator state, waiting files, child ids |
+| GET | `/{workflowId}/result` | Last completed file summary |
+| GET | `/files/{fileId}/result` | Persisted outbound result JSON (`fileId` is the SHA-256) |
+| POST | `/{workflowId}/resolve` | Fan COMPENSATE to waiting children |
 | GET | `/batches/{childWorkflowId}/step` | Child current step |
 | GET | `/batches/{childWorkflowId}/problems` | Child discrepancy ids |
-| POST | `/batches/{childWorkflowId}/resolve` | Resolve a batch or a single `txnId` |
-| GET | `/runs/{runId}` | Persisted run row |
-| GET | `/txns/{txnId}` | Demo: billing vs GL |
-| POST | `/txns/{txnId}/correct` | Demo: `{}` aligns to GL; `{"amount":n}` sets a value |
-| POST | `/api/vendors/bulk`, `/api/customers/bulk` | Mock enrichment endpoints |
+| POST | `/batches/{childWorkflowId}/resolve` | COMPENSATE a batch or a single `txnId` |
+| POST | `/api/vendors/bulk`, `/api/customers/bulk` | Mock enrichment from reference CSVs |
 | GET | `/actuator/health` | Health |
 
----
+## Sample data
+
+```bash
+./scripts/generate-sample-files.sh            # prompts for row count (default 1,200,000)
+./scripts/generate-sample-files.sh 24000      # generate 24,000 rows as a new file
+./scripts/demo.sh data 5000                   # same, via the demo CLI
+```
+
+Windows:
+
+```powershell
+.\scripts\demo.ps1 data 5000
+```
+
+Each generate creates a **new** pair in `sftp/home` (`billing-demo.csv`, then `billing-demo-2.csv`, `billing-demo-3.csv`, …). Existing files are never overwritten.
+
+Seeded anomalies:
+
+- General-ledger mismatches on `id % 10000 = 1` (GL amount + 417)
+- Invalid rows with `amount = 0` on every 5,000th transaction
+
+Working copies land under `sftp/destination/work/{sha256}/` after the API copies the file from `sftp/home`. Reports land under `sftp/destination/outbound/{sha256}/`.
 
 ## Demo script
 
-[`scripts/demo.sh`](scripts/demo.sh) (Linux/macOS) and [`scripts/demo.ps1`](scripts/demo.ps1) (Windows PowerShell) drive a full demonstration. With no arguments they show a menu; subcommands also accept `--up`, `--run`, and similar flags. They start PostgreSQL and the application and expect Temporal at `$TEMPORAL_TARGET` / `$env:TEMPORAL_TARGET`.
+[`scripts/demo.sh`](scripts/demo.sh) (Linux/macOS) and [`scripts/demo.ps1`](scripts/demo.ps1) (Windows PowerShell 5.1) expose the same commands.
 
-| Command | Action |
+| Command | What it does |
 | --- | --- |
-| `up` | Start PostgreSQL and the application (worker + API) |
-| `data` | Load `ROWS` rows |
-| `run` | Start a run; print workflow id, UI link, and waiting children |
-| `status` | Stack health and current-run progress |
-| `resolve` | Interactive: batch COMPENSATE/CONTINUE, a single id, correct-then-CONTINUE, or parent fan-out |
-| `restart` | Restart the application; durable workflows resume |
-| `stop` / `down` | Stop the application and PostgreSQL / also remove the volume |
-| `all` | `up` + `data` + `run` |
-
-Overridable environment (production-like defaults): `ROWS` (1200000), `BATCH_SIZE` (100000), `MAX_PARALLEL` (12), `APP_PORT` (8081), `TEMPORAL_TARGET`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_UI`.
+| *(no args)* | Interactive menu |
+| `up` | Start SFTP + app + coordinator |
+| `start` | Start the long-running coordinator (idempotent) |
+| `data [rows]` | Generate billing + GL CSV + checksums into `sftp/home` |
+| `files` | List billing CSVs in `sftp/home` |
+| `process [file]` | Copy home → destination in the API, then Signal 1 |
+| `status` | Compose containers + coordinator progress |
+| `resolve [all\|batch\|txn]` | COMPENSATE waiting children, one batch, or one txn id |
+| `retry [file]` | Copy again, then Signal 2 (corrected file) |
+| `clear` | Delete every file in `sftp/home` and `sftp/destination` |
+| `fail [name]` | Signal a missing/typed filename (async) → `locateAndValidate` fails **red** and retries; the coordinator continues (failure demo) |
+| `large [rows]` | Generate a large file and process **async** → `locateAndValidate` retries until it lands (durability demo) |
+| `restart` | Restart the local JVM app (not the Docker `app` service) |
+| `stop` | Stop the local app + SFTP |
+| `quickstart [rows]` | `up` + generate sample + process `billing-demo.csv` |
 
 ```bash
-./scripts/demo.sh all
-ROWS=24000 BATCH_SIZE=2000 ./scripts/demo.sh all
+./scripts/demo.sh
+./scripts/demo.sh process billing-demo.csv
+./scripts/demo.sh resolve all
+./scripts/demo.sh fail typo-name.csv       # locate fails red, coordinator keeps running
+./scripts/demo.sh large 800000             # durability: locate retries until the big file lands
+./scripts/demo.sh quickstart 5000
 ```
 
 ```powershell
-.\scripts\demo.ps1 all
-$env:ROWS=24000; $env:BATCH_SIZE=2000; .\scripts\demo.ps1 all
+.\scripts\demo.ps1
+.\scripts\demo.ps1 process billing-demo.csv
+.\scripts\demo.ps1 resolve all
+.\scripts\demo.ps1 quickstart 5000
 ```
 
----
+The demo lists files from the SFTP home drop (`./sftp/home` → `/home/billing/home` in the container). GL companions (`gl-*.csv`) and `.sha256` sidecars are shown as readiness, not as selectable inputs. If the Compose app is already on `:8080`, `process` talks to that instead of starting a second JVM.
+
+`restart` only stops a JVM started by the demo script. It does not run `docker compose restart app`.
 
 ## Tests
 
@@ -422,70 +308,29 @@ mvn test
 
 | Suite | Coverage |
 | --- | --- |
-| [`BillingReconciliationWorkflowTest`](src/test/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowTest.java) | In-memory Temporal: happy path, batch COMPENSATE / CONTINUE, per-id Continue-As-New |
-| [`SchemaValidatorTest`](src/test/java/com/billing/reconciliation/engine/SchemaValidatorTest.java) | Per-field schema rules |
-| [`RecordEnricherTest`](src/test/java/com/billing/reconciliation/engine/RecordEnricherTest.java) | Vendor / customer merge |
-| [`BillingRulesEngineTest`](src/test/java/com/billing/reconciliation/engine/BillingRulesEngineTest.java) | Surcharge, discount, late fee |
-| [`GlMatcherTest`](src/test/java/com/billing/reconciliation/engine/GlMatcherTest.java) | Missing GL and amount mismatch |
-| [`CompensationPolicyTest`](src/test/java/com/billing/reconciliation/engine/CompensationPolicyTest.java) | Align billing to GL and reset processed amounts |
-
----
+| [`BillingReconciliationWorkflowTest`](src/test/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowTest.java) | File signal, hash-fail then retry, COMPENSATE |
+| [`FileActivitiesImplTest`](src/test/java/com/billing/reconciliation/activity/FileActivitiesImplTest.java) | API copy, destination check, run id = SHA-256 |
+| [`FileHasherTest`](src/test/java/com/billing/reconciliation/file/FileHasherTest.java) | SHA-256 and sidecar parsing |
+| Engine tests | Schema, enricher, billing rules, GL match, compensation |
 
 ## Source layout
 
-Paths are under `src/main/java/com/billing/reconciliation/` unless noted.
-
-### Configuration and stack
+Java paths are under `src/main/java/com/billing/reconciliation/` unless noted.
 
 | Item | Path |
 | --- | --- |
 | Application settings | [`src/main/resources/application.yaml`](src/main/resources/application.yaml) |
 | Property binding | [`config/BillingProperties.java`](src/main/java/com/billing/reconciliation/config/BillingProperties.java) |
-| Daily schedule | [`config/ReconciliationScheduleConfig.java`](src/main/java/com/billing/reconciliation/config/ReconciliationScheduleConfig.java) |
-| Temporal Cloud / TLS | [`config/TemporalClientConfig.java`](src/main/java/com/billing/reconciliation/config/TemporalClientConfig.java) |
-| Compose stack | [`docker-compose.yml`](docker-compose.yml) |
-| Database schema | [`docker/postgres/init.sql`](docker/postgres/init.sql) |
-
-### Workflows and API
-
-| Item | Path |
-| --- | --- |
+| Coordinator auto-start | [`config/CoordinatorStarter.java`](src/main/java/com/billing/reconciliation/config/CoordinatorStarter.java) |
 | Parent workflow | [`workflow/BillingReconciliationWorkflowImpl.java`](src/main/java/com/billing/reconciliation/workflow/BillingReconciliationWorkflowImpl.java) |
 | Child workflow | [`workflow/BatchReconciliationWorkflowImpl.java`](src/main/java/com/billing/reconciliation/workflow/BatchReconciliationWorkflowImpl.java) |
 | REST API | [`api/ReconciliationController.java`](src/main/java/com/billing/reconciliation/api/ReconciliationController.java) |
-| Workflow / API models | [`model/`](src/main/java/com/billing/reconciliation/model) (`BatchRef`, `StepResult`, `ReconciliationRequest`, …) |
-
-### Activities
-
-| Item | Path |
-| --- | --- |
-| Ingestion | [`activity/IngestionActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/IngestionActivitiesImpl.java) |
-| Enrichment | [`activity/EnrichmentActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/EnrichmentActivitiesImpl.java) |
-| Billing rules | [`activity/BillingRuleActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/BillingRuleActivitiesImpl.java) |
-| Reconciliation | [`activity/ReconciliationActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/ReconciliationActivitiesImpl.java) |
-| Compensation | [`activity/CompensationActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/CompensationActivitiesImpl.java) |
-| Reporting | [`activity/ReportingActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/ReportingActivitiesImpl.java) |
-
-### Java engines
-
-All business rules live in [`engine/`](src/main/java/com/billing/reconciliation/engine): `SchemaValidator`, `RecordEnricher`, `BillingRulesEngine`, `GlMatcher`, `CompensationPolicy`.
-
-### DTOs
-
-Row and enrichment payloads used by activities and persistence. Package: [`dto/`](src/main/java/com/billing/reconciliation/dto).
-
-| DTO | Used for |
-| --- | --- |
-| `BillingTransactionDto` | Schema validation |
-| `ValidationErrorDto` | Per-field validation failures |
-| `VendorDto` / `CustomerDto` | Enrichment HTTP and cache |
-| `ProcessedTransactionDto` | Enrichment and billing rules |
-| `DiscrepancyDto` | GL match results |
-| `BillingAmountCorrection` | Compensation (align billing to GL) |
-
-### Persistence
-
-| Item | Path |
-| --- | --- |
-| JDBC load / persist | [`db/BillingJdbc.java`](src/main/java/com/billing/reconciliation/db/BillingJdbc.java) |
-
+| Home → destination copy (API) | [`file/InboundFileTransfer.java`](src/main/java/com/billing/reconciliation/file/InboundFileTransfer.java) |
+| File store / CSV | [`file/ReconciliationFileStore.java`](src/main/java/com/billing/reconciliation/file/ReconciliationFileStore.java) |
+| SFTP home / destination | [`file/SftpInboundFiles.java`](src/main/java/com/billing/reconciliation/file/SftpInboundFiles.java), [`file/LocalInboundFiles.java`](src/main/java/com/billing/reconciliation/file/LocalInboundFiles.java) |
+| File integrity activity | [`activity/FileActivitiesImpl.java`](src/main/java/com/billing/reconciliation/activity/FileActivitiesImpl.java) |
+| Compose stack | [`docker-compose.yml`](docker-compose.yml) |
+| SFTP users | [`docker/sftp/users.conf`](docker/sftp/users.conf) |
+| Demo CLI (Linux/macOS) | [`scripts/demo.sh`](scripts/demo.sh) |
+| Demo CLI (Windows PS 5.1) | [`scripts/demo.ps1`](scripts/demo.ps1) |
+| Sample generator | [`scripts/generate-sample-files.py`](scripts/generate-sample-files.py) |

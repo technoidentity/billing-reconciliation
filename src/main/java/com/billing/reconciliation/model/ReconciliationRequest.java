@@ -22,7 +22,11 @@ public class ReconciliationRequest {
     private String teamsChannel;
     private long workflowExecutionTimeoutSeconds;
     private long childExecutionTimeoutSeconds;
+    private long continueAsNewHistoryBytes;
+    private int maxFileValidationAttempts;
+    private long fileValidationRetryIntervalSeconds;
     private ActivityPolicyConfig ingestion;
+    private ActivityPolicyConfig fileValidation;
     private ActivityPolicyConfig enrichment;
     private ActivityPolicyConfig billingRules;
     private ActivityPolicyConfig reconciliation;
@@ -165,12 +169,44 @@ public class ReconciliationRequest {
         this.childExecutionTimeoutSeconds = childExecutionTimeoutSeconds;
     }
 
+    public long getContinueAsNewHistoryBytes() {
+        return continueAsNewHistoryBytes;
+    }
+
+    public void setContinueAsNewHistoryBytes(long continueAsNewHistoryBytes) {
+        this.continueAsNewHistoryBytes = continueAsNewHistoryBytes;
+    }
+
+    public int getMaxFileValidationAttempts() {
+        return maxFileValidationAttempts;
+    }
+
+    public void setMaxFileValidationAttempts(int maxFileValidationAttempts) {
+        this.maxFileValidationAttempts = maxFileValidationAttempts;
+    }
+
+    public long getFileValidationRetryIntervalSeconds() {
+        return fileValidationRetryIntervalSeconds;
+    }
+
+    public void setFileValidationRetryIntervalSeconds(long fileValidationRetryIntervalSeconds) {
+        this.fileValidationRetryIntervalSeconds = fileValidationRetryIntervalSeconds;
+    }
+
     public ActivityPolicyConfig getIngestion() {
         return ingestion;
     }
 
     public void setIngestion(ActivityPolicyConfig ingestion) {
         this.ingestion = ingestion;
+    }
+
+    public ActivityPolicyConfig getFileValidation() {
+        return fileValidation;
+    }
+
+    public void setFileValidation(ActivityPolicyConfig fileValidation) {
+        this.fileValidation = fileValidation;
     }
 
     public ActivityPolicyConfig getEnrichment() {

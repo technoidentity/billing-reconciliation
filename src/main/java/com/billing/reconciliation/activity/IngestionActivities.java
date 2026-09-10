@@ -5,16 +5,11 @@ import com.billing.reconciliation.model.StepResult;
 import io.temporal.activity.ActivityInterface;
 import io.temporal.activity.ActivityMethod;
 
-import java.util.List;
-
 @ActivityInterface
 public interface IngestionActivities {
 
     @ActivityMethod
-    void startRun(String runId, String workflowId);
-
-    @ActivityMethod
-    List<BatchRef> listBatches(int batchSize);
+    void startRun(String runId, String fileId, String workflowId);
 
     @ActivityMethod
     StepResult validateSchema(String runId, BatchRef batch);

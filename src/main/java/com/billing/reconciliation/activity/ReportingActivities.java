@@ -10,14 +10,14 @@ import io.temporal.activity.ActivityMethod;
 public interface ReportingActivities {
 
     @ActivityMethod
-    StepResult generateReports(String runId);
+    StepResult generateReports(String runId, String fileId);
 
     @ActivityMethod
-    StepResult notifyStakeholders(String runId, ReconciliationRequest request);
+    StepResult notifyStakeholders(String runId, String fileId, ReconciliationRequest request);
 
     @ActivityMethod
-    StepResult logAuditTrail(String runId, String stepName, String message);
+    StepResult logAuditTrail(String runId, String fileId, String stepName, String message);
 
     @ActivityMethod
-    void completeRun(String runId, ReconciliationResult result);
+    void completeRun(String runId, String fileId, ReconciliationResult result);
 }

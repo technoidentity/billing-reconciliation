@@ -6,6 +6,8 @@ import java.util.List;
 public class ReconciliationResult {
 
     private String runId;
+    private String fileId;
+    private String fileName;
     private String status;
     private long totalTxns;
     private long validTxns;
@@ -21,6 +23,22 @@ public class ReconciliationResult {
 
     public void setRunId(String runId) {
         this.runId = runId;
+    }
+
+    public String getFileId() {
+        return fileId;
+    }
+
+    public void setFileId(String fileId) {
+        this.fileId = fileId;
+    }
+
+    public String getFileName() {
+        return fileName;
+    }
+
+    public void setFileName(String fileName) {
+        this.fileName = fileName;
     }
 
     public String getStatus() {

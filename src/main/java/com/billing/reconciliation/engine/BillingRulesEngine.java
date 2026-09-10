@@ -9,7 +9,7 @@ import java.time.LocalDate;
 import java.util.List;
 
 /**
- * Tiered surcharge, volume discount, and late-fee math. No JDBC — callers persist the result.
+ * Tiered surcharge, volume discount, and late-fee math. Callers write the result to CSV.
  */
 @Component
 public class BillingRulesEngine {
@@ -18,7 +18,7 @@ public class BillingRulesEngine {
      * Sets {@code finalAmount} from {@code originalAmount}: percent surcharge above the high
      * threshold, otherwise a flat fee above the mid threshold, otherwise pass-through.
      *
-     * @return number of rows inspected (entire list, matching the previous full-batch UPDATE)
+     * @return number of rows inspected
      */
     public int applySurcharge(List<ProcessedTransactionDto> rows, BillingRuleParams params) {
         if (rows == null || rows.isEmpty()) {

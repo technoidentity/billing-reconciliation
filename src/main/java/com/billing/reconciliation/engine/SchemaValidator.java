@@ -9,7 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Per-field schema rules for a billing transaction DTO. No JDBC — callers persist the result.
+ * Per-field schema rules for a billing transaction. Callers write failures to CSV.
  */
 @Component
 public class SchemaValidator {

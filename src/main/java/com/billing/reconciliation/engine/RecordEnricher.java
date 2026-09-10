@@ -12,8 +12,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Merges vendor and customer names onto valid billing rows. No JDBC — callers persist the result.
- * Rows without a cache hit are skipped (same as the previous INNER JOIN).
+ * Merges vendor and customer names onto valid billing rows. Rows without a matching
+ * vendor or customer are skipped. Callers write the result to CSV.
  */
 @Component
 public class RecordEnricher {
@@ -47,7 +47,7 @@ public class RecordEnricher {
                     BigDecimal.ZERO,
                     amount,
                     batchNo,
-                    null));
+                    row.getDueDate()));
         }
         return processed;
     }

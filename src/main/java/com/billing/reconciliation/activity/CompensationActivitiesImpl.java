@@ -2,9 +2,10 @@ package com.billing.reconciliation.activity;
 
 import com.billing.reconciliation.config.TaskQueues;
 import com.billing.reconciliation.engine.CompensationPolicy;
-import com.billing.reconciliation.db.BillingJdbc;
 import com.billing.reconciliation.dto.BillingAmountCorrection;
 import com.billing.reconciliation.dto.ProcessedTransactionDto;
+import com.billing.reconciliation.file.ReconciliationFileStore;
+import com.billing.reconciliation.model.BatchRef;
 import com.billing.reconciliation.model.StepResult;
 import io.temporal.spring.boot.ActivityImpl;
 import org.springframework.stereotype.Component;
@@ -17,29 +18,30 @@ import java.util.Map;
 @ActivityImpl(taskQueues = TaskQueues.BILLING)
 public class CompensationActivitiesImpl implements CompensationActivities {
 
-    private final BillingJdbc jdbc;
+    private final ReconciliationFileStore files;
     private final CompensationPolicy compensationPolicy;
 
-    public CompensationActivitiesImpl(BillingJdbc jdbc, CompensationPolicy compensationPolicy) {
-        this.jdbc = jdbc;
+    public CompensationActivitiesImpl(ReconciliationFileStore files, CompensationPolicy compensationPolicy) {
+        this.files = files;
         this.compensationPolicy = compensationPolicy;
     }
 
     @Override
-    public StepResult compensateDiscrepancies(String runId, List<String> txnIds) {
+    public StepResult compensateDiscrepancies(String runId, BatchRef batch, List<String> txnIds) {
         Heartbeats.beat("compensate");
         if (txnIds == null || txnIds.isEmpty()) {
             return new StepResult("COMPENSATE", 0, "Compensated []");
         }
-        Map<String, BigDecimal> glByTxn = jdbc.loadGlAmounts(txnIds);
+        Map<String, BigDecimal> glByTxn = files.loadGlAmounts(batch, txnIds);
         List<BillingAmountCorrection> corrections = compensationPolicy.billingCorrections(txnIds, glByTxn);
-        List<ProcessedTransactionDto> processed = jdbc.loadProcessedByTxnIds(runId, txnIds);
+        List<ProcessedTransactionDto> processed = files.loadProcessedByTxnIds(batch, txnIds);
         compensationPolicy.resetProcessed(processed);
-        jdbc.updateBillingAmounts(corrections);
-        jdbc.updateProcessedMoney(runId, processed);
-        jdbc.markDiscrepanciesCompensated(runId, txnIds);
+        files.updateBillingAmounts(batch, corrections);
+        files.updateProcessedMoney(batch, processed);
+        files.markDiscrepanciesCompensated(batch, txnIds);
         Heartbeats.beat("compensate-done-" + corrections.size());
-        jdbc.logAudit(runId, "COMPENSATE", "Reversed adjustments on " + corrections.size() + " problem ids: " + txnIds);
+        files.logAudit(batch.getFileId(), "COMPENSATE",
+                "Aligned billing amounts to GL on " + corrections.size() + " problem ids: " + txnIds);
         return new StepResult("COMPENSATE", corrections.size(), "Compensated " + txnIds);
     }
 }

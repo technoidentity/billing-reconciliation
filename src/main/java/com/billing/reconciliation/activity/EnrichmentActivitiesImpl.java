@@ -2,12 +2,12 @@ package com.billing.reconciliation.activity;
 
 import com.billing.reconciliation.config.BillingProperties;
 import com.billing.reconciliation.config.TaskQueues;
-import com.billing.reconciliation.db.BillingJdbc;
 import com.billing.reconciliation.dto.BillingTransactionDto;
 import com.billing.reconciliation.dto.CustomerDto;
 import com.billing.reconciliation.dto.ProcessedTransactionDto;
 import com.billing.reconciliation.dto.VendorDto;
 import com.billing.reconciliation.engine.RecordEnricher;
+import com.billing.reconciliation.file.ReconciliationFileStore;
 import com.billing.reconciliation.model.BatchRef;
 import com.billing.reconciliation.model.StepResult;
 import io.temporal.activity.Activity;
@@ -33,13 +33,14 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
 
     private static final Logger log = LoggerFactory.getLogger(EnrichmentActivitiesImpl.class);
 
-    private final BillingJdbc jdbc;
+    private final ReconciliationFileStore files;
     private final BillingProperties properties;
     private final RestClient restClient;
     private final RecordEnricher recordEnricher;
 
-    public EnrichmentActivitiesImpl(BillingJdbc jdbc, BillingProperties properties, RecordEnricher recordEnricher) {
-        this.jdbc = jdbc;
+    public EnrichmentActivitiesImpl(ReconciliationFileStore files, BillingProperties properties,
+                                    RecordEnricher recordEnricher) {
+        this.files = files;
         this.properties = properties;
         this.recordEnricher = recordEnricher;
         int timeoutMs = (int) properties.getVendorApi().getTimeout().toMillis();
@@ -52,7 +53,7 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
     @Override
     public StepResult fetchVendorData(String runId, BatchRef batch) {
         Heartbeats.beat("vendors-batch-" + batch.getBatchNo());
-        List<String> ids = jdbc.distinctVendorIds(batch.getFromId(), batch.getToId());
+        List<String> ids = files.distinctVendorIds(batch);
         BillingProperties.ApiEndpoint api = properties.getVendorApi();
         List<VendorDto> vendors;
         try {
@@ -66,7 +67,7 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
             vendors = fallbackVendors(ids, ex);
         }
         Heartbeats.beat("vendors-save-" + batch.getBatchNo());
-        jdbc.saveVendorCache(runId, vendors);
+        files.saveVendorCache(batch, vendors);
         return new StepResult("FETCH_VENDOR_DATA", vendors.size(),
                 "Fetched vendors via parallel bulk calls (max " + api.getMaxConcurrentCalls() + " concurrent)");
     }
@@ -74,7 +75,7 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
     @Override
     public StepResult fetchCustomerData(String runId, BatchRef batch) {
         Heartbeats.beat("customers-batch-" + batch.getBatchNo());
-        List<String> ids = jdbc.distinctCustomerIds(batch.getFromId(), batch.getToId());
+        List<String> ids = files.distinctCustomerIds(batch);
         BillingProperties.ApiEndpoint api = properties.getCustomerApi();
         List<CustomerDto> customers;
         try {
@@ -88,7 +89,7 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
             customers = fallbackCustomers(ids, ex);
         }
         Heartbeats.beat("customers-save-" + batch.getBatchNo());
-        jdbc.saveCustomerCache(runId, customers);
+        files.saveCustomerCache(batch, customers);
         return new StepResult("FETCH_CUSTOMER_DATA", customers.size(),
                 "Fetched customers via parallel bulk calls (max " + api.getMaxConcurrentCalls() + " concurrent)");
     }
@@ -96,31 +97,26 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
     @Override
     public StepResult enrichRecords(String runId, BatchRef batch) {
         Heartbeats.beat("enrich-start-" + batch.getBatchNo());
-        List<BillingTransactionDto> rows = jdbc.loadValidBatch(batch.getFromId(), batch.getToId());
-        Map<String, VendorDto> vendors = jdbc.loadVendorCache(runId);
-        Map<String, CustomerDto> customers = jdbc.loadCustomerCache(runId);
+        List<BillingTransactionDto> rows = files.loadValidBatch(batch);
+        Map<String, VendorDto> vendors = files.loadVendorCache(batch);
+        Map<String, CustomerDto> customers = files.loadCustomerCache(batch);
         List<ProcessedTransactionDto> processed = new ArrayList<>();
         int total = rows.size();
         for (int i = 0; i < total; i += Heartbeats.CHUNK) {
             List<BillingTransactionDto> chunk = rows.subList(i, Math.min(i + Heartbeats.CHUNK, total));
             List<ProcessedTransactionDto> enriched = recordEnricher.enrich(chunk, vendors, customers, batch.getBatchNo());
             processed.addAll(enriched);
-            jdbc.upsertProcessedTransactions(runId, enriched);
             Heartbeats.beat("enrich-chunk-" + Math.min(i + Heartbeats.CHUNK, total) + "/" + total);
         }
         if (total == 0) {
             Heartbeats.beat("enrich-chunk-0/0");
         }
+        files.writeProcessed(batch, processed);
         Heartbeats.beat("enrich-done-" + batch.getBatchNo());
         return new StepResult("ENRICH_RECORDS", processed.size(),
                 "Merged vendor and customer data for batch " + batch.getBatchNo());
     }
 
-    /**
-     * Splits {@code ids} into chunks of {@code chunkSize} and calls the bulk endpoint for each chunk
-     * concurrently, capped at {@code maxConcurrent} in-flight requests. Throws if any chunk fails so
-     * the caller can fall back to the local table (and Temporal can retry the activity).
-     */
     private <T> List<T> callInParallel(String url, List<String> ids, int maxConcurrent, int chunkSize,
                                        ParameterizedTypeReference<List<T>> responseType, String beatPrefix) {
         if (ids.isEmpty()) {
@@ -166,8 +162,8 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
         if (attempt < maxAttempts) {
             throw new RuntimeException("Vendor API failed on attempt " + attempt, ex);
         }
-        log.warn("Vendor API failed after {} attempts, using local vendor table", attempt, ex);
-        return jdbc.findVendors(ids);
+        log.warn("Vendor API failed after {} attempts, using reference vendor file", attempt, ex);
+        return files.findReferenceVendors(ids);
     }
 
     private List<CustomerDto> fallbackCustomers(List<String> ids, Exception ex) {
@@ -176,7 +172,7 @@ public class EnrichmentActivitiesImpl implements EnrichmentActivities {
         if (attempt < maxAttempts) {
             throw new RuntimeException("Customer API failed on attempt " + attempt, ex);
         }
-        log.warn("Customer API failed after {} attempts, using local customer table", attempt, ex);
-        return jdbc.findCustomers(ids);
+        log.warn("Customer API failed after {} attempts, using reference customer file", attempt, ex);
+        return files.findReferenceCustomers(ids);
     }
 }

@@ -6,7 +6,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 /**
- * One per-field schema failure to persist in {@code validation_errors}.
+ * One per-field schema failure written to {@code validation-errors-batch-n.csv}.
  */
 @Getter
 @Setter
