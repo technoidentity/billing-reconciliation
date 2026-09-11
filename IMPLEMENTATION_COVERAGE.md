@@ -1,19 +1,19 @@
 # Implementation Coverage — File-based Billing Reconciliation
 
-Maps the current implementation to the file-based requirement: SFTP CSV input, one long-running
-coordinator driven by signals, hash-validation with retries, child workflows on file slices,
-COMPENSATE-only resolution, and periodic Continue-As-New. There is **no database** — Temporal keeps
-workflow history (in its own store); all billing data and outputs are files.
+Maps the current implementation to the changed requirements: transactions are read from input files,
+the parent validates each file before fan-out and waits for a corrected-file signal after validation
+failure, and child compensation calculates corrections in memory before persisting corrected working
+state to files. There is **no billing database**; all billing data and outputs are files.
 
 ## Architecture layers
 
 | Layer | Responsibility | Key types |
 |---|---|---|
 | Coordinator (parent) | Long-running; waits for file signals, validates, fans out, Continue-As-New | `BillingReconciliationWorkflowImpl` |
-| Child | Reconciles one file slice; COMPENSATE-only | `BatchReconciliationWorkflowImpl` |
+| Child | Reconciles one file slice; calculates COMPENSATE corrections in memory and reprocesses file state | `BatchReconciliationWorkflowImpl` |
 | File activities | Locate + SHA-256 validate (throws/retries); slice batches | `FileActivitiesImpl` |
 | Engines (pure Java) | Validation, enrichment, billing math, GL match, compensation | `SchemaValidator`, `RecordEnricher`, `BillingRulesEngine`, `GlMatcher`, `CompensationPolicy` |
-| File store | Read slices, write processed/discrepancy/report CSVs under `destination/work` + `outbound` | `ReconciliationFileStore` |
+| File store | Read slices and persist working, compensated, discrepancy, audit, result, and report files | `ReconciliationFileStore` |
 | Inbound files | SFTP (`sshj`) or local dir; copy home→destination | `SftpInboundFiles`, `LocalInboundFiles`, `InboundFileTransfer` |
 | API | `/start`, `/files/available` (Signal 1), `/files/retry` (Signal 2), `/resolve` (COMPENSATE) | `ReconciliationController` |
 
@@ -25,11 +25,11 @@ workflow history (in its own store); all billing data and outputs are files.
 | One long-running parent, starts once, no schedule | Covered | `CoordinatorStarter` starts a single fixed id `billing-reconciliation-coordinator` on boot (idempotent). `run()` is a `while(!shutdown)` signal loop. No Temporal Schedule. |
 | Signal 1 — new file → hash-validation activity | Covered | `@SignalMethod fileAvailable` queues the file; `FileActivities.locateAndValidate` computes SHA-256 and compares to the **producer sidecar** (independent reference), run identity = the checksum. |
 | Validation success → start child workflow(s) | Covered | On success the file is promoted to `destination/work/{sha256}/`, sliced by row count, and one `BatchReconciliationWorkflow` per slice is started. |
-| Validation failure → keep file waiting (no terminate) | Covered | The activity **throws** (red in the UI). The parent **catches** the `ActivityFailure`, parks the file in `WAITING_FOR_CORRECTION`, and keeps processing other files. |
-| Signal 2 — retry corrected file, configured attempts | Covered | `@SignalMethod retryCorrectedFile` re-runs `locateAndValidate`, whose Temporal retry policy retries "not found yet" up to `billing.file-validation.max-retry-attempts` (default 3). |
+| Validation failure → activity fails and parent waits for correction | Covered | `locateAndValidate` throws after its configured activity retries, so the activity is failed/red in Temporal. The parent catches `ActivityFailure`, records the error, enters `WAITING_FOR_CORRECTION`, and remains running. |
+| Signal 2 — corrected file is reprocessed in the same workflow | Covered | `retryCorrectedFile` copies the corrected CSV/sidecar synchronously by default, queues it for the same coordinator, and re-runs validation and child fan-out. |
 | Parent stays active for subsequent files | Covered | After each file it returns to `LISTENING`; signals are buffered while busy. (Files are processed sequentially — see Notes.) |
 | Children operate on file data only | Covered | Activities read slices via `ReconciliationFileStore.loadBatch`; outputs are CSVs. No DB. |
-| No DB correction/manual-fix; COMPENSATE only | Covered | Controller and child reject any non-`COMPENSATE` decision; there is no `/txns/correct` endpoint. COMPENSATE writes GL amounts into the batch CSV, then Continue-As-New. |
+| No DB correction/manual-fix; COMPENSATE only | Covered | Controller and child reject non-`COMPENSATE`; `/txns/correct` was removed. Compensation loads affected rows/GL amounts, calculates corrections in memory, then writes corrected billing/processed/discrepancy CSVs and Continue-As-News. No database mutation occurs. |
 | Continue-As-New to bound history | Covered | Parent CANs on `Workflow.getInfo().isContinueAsNewSuggested()` (size **and** event count); optional byte override `continue-as-new-history-bytes` (0 = off, cap 50MB). Carries pending files, waiting state, recent results. |
 | Data drop is external; a signal triggers validation with retries | Covered | The API only moves home→destination and signals; validation + retry happen in Temporal. |
 | SFTP folder mounting | Covered | `docker/sftp` (atmoz/sftp) with `./sftp/home` and `./sftp/destination` bind-mounted. |
@@ -52,15 +52,16 @@ workflow history (in its own store); all billing data and outputs are files.
 | Billing/GL/sidecar not present yet | `FileNotFound` / `GlFileNotFound` / `ChecksumNotFound` | Retryable (large file still landing) |
 | Content ≠ sidecar | `HashMismatch` / `GlHashMismatch` | Non-retryable (must be corrected + re-sent) |
 
-All failures show the activity **red** in the UI; the coordinator catches them and parks the file for a
-Signal-2 retry while other files continue.
+Validation failures show the activity **red** after retries are exhausted; the coordinator catches
+them and parks the file for Signal 2 while other files continue.
 
 ## Child pipeline (per slice)
 
 `VALIDATE_SCHEMA → HANDLE_VALIDATION_ERRORS → FETCH_VENDOR/CUSTOMER → ENRICH → APPLY_BILLING_RULES →
 CALCULATE_ADJUSTMENTS → APPLY_PENALTIES → QUERY_GL → MATCH_TRANSACTIONS → IDENTIFY_DISCREPANCIES`. On a
-mismatch the child waits for COMPENSATE, writes GL amounts into the batch CSV, and Continue-As-News to
-re-check (bounded by `max-resolution-rounds`).
+mismatch the child waits for COMPENSATE. The activity calculates the correction in memory, persists
+the corrected working CSV state, and Continue-As-News so the child re-reads and re-checks the batch
+(bounded by `max-resolution-rounds`).
 
 ## Mocked / demo-only
 

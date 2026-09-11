@@ -74,14 +74,14 @@ Starts **once** (`billing-reconciliation-coordinator`) and stays running. No Tem
 2. The `locateAndValidate` activity finds the file in destination and SHA-256-validates it against the producer sidecar. It **throws on failure** (red in the UI): "not found yet" is **retryable** (a large file still landing is retried, per `billing.file-validation.max-retry-attempts`, default 3), "present but wrong" (hash mismatch) is **non-retryable**.
 3. On success it promotes to `destination/work/{sha256}/`, slices, and starts child workflows.
 4. On failure the parent **catches the activity failure**, parks the file in **WAITING_FOR_CORRECTION**, and keeps processing other files (it never terminates).
-5. **Signal 2 — `retryCorrectedFile`:** the API copies the corrected drop again; the parent re-runs `locateAndValidate` (which retries internally).
+5. **Signal 2 — `retryCorrectedFile`:** after the corrected CSV and sidecar replace the failed drop, the API copies them again (synchronously by default); the same parent workflow re-runs `locateAndValidate` and then reprocesses the file through child workflows.
 6. When a file’s children finish, the parent writes reports under `destination/outbound/{sha256}/` and waits for the next file.
 
 **Continue-As-New** is driven by Temporal's `isContinueAsNewSuggested()` (covers history size **and** event count). `billing.workflow.continue-as-new-history-bytes` is an optional byte override (**0 = off**, capped at **50MB**). CAN only fires when the parent is idle; pending files, waiting-for-correction state, and recent results are carried forward under the same workflow id.
 
 ### Child: `BatchReconciliationWorkflow`
 
-Children operate on file slices only. Discrepancy resolution is **COMPENSATE only** (align billing CSV amounts to the GL file).
+Children operate on file slices only. Discrepancy resolution is **COMPENSATE only** (align billing CSV amounts to the GL file). Corrections are calculated in memory, then corrected billing, processed, and discrepancy state is persisted to CSV so Continue-As-New can reload it. No billing database is updated.
 
 ```
   VALIDATE_SCHEMA
@@ -101,7 +101,7 @@ Children operate on file slices only. Discrepancy resolution is **COMPENSATE onl
             └── mismatches and round < 10
                       WAITING_FOR_SIGNAL
                             │
-                            │  COMPENSATE  →  write GL amounts into the batch CSV, then Continue-As-New
+                            │  COMPENSATE  →  calculate in memory, persist corrected CSV state, then Continue-As-New
                             ▼
                       round + 1, same workflow id, back to VALIDATE_SCHEMA
 ```
@@ -251,6 +251,11 @@ Windows:
 
 Each generate creates a **new** pair in `sftp/home` (`billing-demo.csv`, then `billing-demo-2.csv`, `billing-demo-3.csv`, …). Existing files are never overwritten.
 
+Because generated names are suffixed when a stem already exists, pass the actual filename shown by
+`files` to `process` (and to `retry` after replacing a failed drop). `quickstart` and `large` use
+the first generated filename (`billing-demo.csv` and `bigfile.csv` respectively), so use `clear`
+first or run the commands with a clean SFTP home when using those shortcuts repeatedly.
+
 Seeded anomalies:
 
 - General-ledger mismatches on `id % 10000 = 1` (GL amount + 417)
@@ -278,7 +283,7 @@ Working copies land under `sftp/destination/work/{sha256}/` after the API copies
 | `large [rows]` | Generate a large file and process **async** → `locateAndValidate` retries until it lands (durability demo) |
 | `restart` | Restart the local JVM app (not the Docker `app` service) |
 | `stop` | Stop the local app + SFTP |
-| `quickstart [rows]` | `up` + generate sample + process `billing-demo.csv` |
+| `quickstart [rows]` | `up` + generate sample + process `billing-demo.csv` (use with a clean home; generated names can be suffixed) |
 
 ```bash
 ./scripts/demo.sh
@@ -298,7 +303,63 @@ Working copies land under `sftp/destination/work/{sha256}/` after the API copies
 
 The demo lists files from the SFTP home drop (`./sftp/home` → `/home/billing/home` in the container). GL companions (`gl-*.csv`) and `.sha256` sidecars are shown as readiness, not as selectable inputs. If the Compose app is already on `:8080`, `process` talks to that instead of starting a second JVM.
 
+For a validation failure, replace the billing CSV and its `.sha256` sidecar in `sftp/home`, then run
+`retry [file]`. The retry copies the corrected drop and signals the existing coordinator; it does not
+start a separate reconciliation workflow.
+
 `restart` only stops a JVM started by the demo script. It does not run `docker compose restart app`.
+
+### Demo flow details
+
+The following maps each `scripts/demo.ps1` option to the workflow behavior. All file submissions use
+the same long-running `billing-reconciliation-coordinator`; a new parent workflow is not created per
+file.
+
+| Option / command | What it does and how workflow state changes |
+| --- | --- |
+| `1` / `up` | Starts SFTP and the local app, then calls `POST /start`. The coordinator enters `LISTENING`. Temporal must already be reachable. |
+| `2` / `data [rows]` | Generates billing/GL CSVs, SHA-256 sidecars, and reference data in `sftp/home` / `destination/reference`. Existing files are preserved and new names may be suffixed. |
+| `3` / `files` | Lists selectable billing drops and reports sidecar/GL readiness. It does not change workflow state. |
+| `4` / `process [file]` | Sends Signal 1 (`fileAvailable`). The API copies the drop and the coordinator validates it, then slices it and starts child workflows. Copy ordering follows `billing.files.async-copy`. |
+| `5` / `status` | Reads coordinator progress, including current step, file, batches, child IDs, pending files, correction waits, and last result. |
+| `6` / `resolve [all\|batch\|txn]` | Sends COMPENSATE to all waiting children, one child, or one transaction. Corrections are calculated in memory, persisted to CSV, and the child Continue-As-News to reprocess. |
+| `7` / `retry [file]` | Sends Signal 2 (`retryCorrectedFile`). The corrected drop is copied and the existing coordinator revalidates and reprocesses it. This is the intended path for `WAITING_FOR_CORRECTION`. |
+| `8` / `restart` | Restarts only the locally launched JVM and reconnects to the same Temporal coordinator. |
+| `9` / `stop` | Stops the local app and SFTP; it does not delete files or Temporal history. |
+| `down` | Stops the demo and runs `docker compose down`; it does not remove the Temporal history volume. |
+| `clear` | Deletes and recreates the SFTP home/destination contents. It does not reset workflow history. |
+| `fail [name]` | Sends Signal 1 for a missing filename with async mode. Locate retries `FileNotFound`, then the parent parks the file in `WAITING_FOR_CORRECTION`. |
+| `large [rows]` | Generates `bigfile` data and sends Signal 1 with `async=true`, demonstrating locate retries while the copy is still landing. |
+| `quickstart [rows]` | Runs `up`, `data`, and `process billing-demo.csv`; use a clean SFTP home because repeated generation creates suffixed names. |
+
+### Happy-path demonstrations
+
+For synchronous behavior, set `$env:BILLING_FILES_ASYNC_COPY = "false"` before `up`, run `data`,
+identify the file with `files`, and select it with `process` (option 4). The API copies the billing
+CSV, sidecar, and GL companion before sending Signal 1, so `locateAndValidate` normally succeeds on
+its first activity attempt. The parent then promotes the file, slices it, and starts child workflows.
+
+For asynchronous behavior, set `$env:BILLING_FILES_ASYNC_COPY = "true"` before `up`, or run `large`
+(option L). Signal 1 is sent while the copy runs in the background. `locateAndValidate` may fail with
+`FileNotFound` on its first attempt, then Temporal retries until the file arrives and validation
+succeeds. Use `status` and the Temporal UI to observe the retry and child fan-out.
+
+### File-validation failure and correction
+
+1. Run `up`, then `data`, and use `files` to identify the billing CSV.
+2. Edit the generated billing CSV or its `.sha256` sidecar in `sftp/home` so the actual and expected
+   hashes no longer match.
+3. Use `process <file>` (option 4). This sends Signal 1 for the invalid drop.
+4. `locateAndValidate` fails with `HashMismatch` after the configured activity policy. The parent
+   catches the failure, remains running, and enters `WAITING_FOR_CORRECTION`.
+5. Restore the CSV, regenerate its matching sidecar, or replace both with a correct generated pair.
+6. Use `retry <file>` (option 7). This sends Signal 2, copies the corrected drop, and causes the same
+   coordinator to revalidate and reprocess the corrected file.
+
+Option 4 can submit a corrected same-named file as another normal Signal-1 file-available event, but
+it does not acknowledge/remove the parked correction entry. Option 7 is the semantically correct
+correction path. If a newly generated filename is used, option 4 is the normal new-file path; option 7
+can also submit it, but it is intended for a correction retry.
 
 ## Tests
 

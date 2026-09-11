@@ -42,7 +42,7 @@ logging:
 # these values as input so activity timeouts stay deterministic on replay.
 billing:
   task-queue: ${TEMPORAL_TASK_QUEUE:billing-reconciliation-queue}
-  batch-size: ${BILLING_BATCH_SIZE:10000}
+  batch-size: ${BILLING_BATCH_SIZE:100000}
   max-parallel-batches: ${BILLING_MAX_PARALLEL_BATCHES:12}
 
   coordinator:
